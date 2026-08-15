@@ -10,7 +10,17 @@
  * the evidence that the chosen cap is the right one, in the same role
  * test/bench-soa.mjs plays for @zakkster/lite-particles decisions/0010.
  *
- * PASS CONDITION, WRITTEN BEFORE THE NUMBERS (all six must hold):
+ * WHAT THIS SWEEP ALLOCATES, AND WHY IT IS NOT THE ENGINE
+ * The child allocates the seven lanes RAW (`new Float32Array(n)` x6 +
+ * `new Int32Array(n)`), not `new SoaParticleEngine(n)`. From v1.0.4 the
+ * constructor enforces MAX_PARTICLES, so sweeping through it would be circular:
+ * every oversized row would "fail politely" because of the cap this file exists
+ * to justify. C6 would then report a catchable-failure band belonging to the
+ * library rather than to V8 -- which inverts its meaning -- and C5 would observe
+ * no abort at all and pass vacuously. The claim under test is a property of the
+ * ALLOCATOR; the shipped constructor is checked once, separately, by C8.
+ *
+ * PASS CONDITION, WRITTEN BEFORE THE NUMBERS (all eight must hold):
  *   C1 the candidate ceiling constructs
  *   C2 all 7 lanes at the candidate are writable AND read back end-to-end
  *   C3 resident footprint matches the analytic 28*C bytes within tolerance
@@ -28,6 +38,10 @@
  *      targets, not the largest it was measured on. Without C7 this harness
  *      would rubber-stamp whatever the developer's workstation happened to
  *      hold, which is how a ceiling becomes an accident of hardware.
+ *   C8 the SHIPPED constructor enforces exactly this candidate: its exported
+ *      MAX_PARTICLES equals it, it accepts n, and it rejects n+1 with a branded
+ *      RangeError. The one criterion that looks at the library, so the cap
+ *      cannot drift away from the evidence here without a run turning red.
  * FAIL ACTION: do not ship the candidate. Record the measured numbers and pick
  * again from this table. Never widen a criterion to make a run pass.
  *
@@ -75,18 +89,32 @@ if (process.env.CEILING_CHILD !== undefined) {
     const out = { n, touched: touch };
     try {
         const t0 = process.hrtime.bigint();
-        const { SoaParticleEngine } = await import('../SoaParticleEngine.js');
-        const e = new SoaParticleEngine(n);
+        // RAW lane allocation -- deliberately NOT `new SoaParticleEngine(n)`.
+        //
+        // From v1.0.4 the constructor enforces MAX_PARTICLES, so going through it
+        // would make this harness CIRCULAR: every size above the candidate would
+        // "fail politely" because of the very cap this sweep exists to justify,
+        // C6 would report a catchable-failure band that belongs to the library
+        // rather than to V8, and C5 would find no abort at all and pass
+        // vacuously (Infinity / CANDIDATE >= MARGIN is trivially true).
+        //
+        // The fact P-18 rests on is a property of the ALLOCATOR: seven unvalidated
+        // TypedArray constructors have a size past which V8 calls abort() instead
+        // of throwing. That is what must be measured here. The shipped
+        // constructor's behaviour is checked separately, by C8.
+        const lanes = [
+            new Float32Array(n), new Float32Array(n), new Float32Array(n),
+            new Float32Array(n), new Float32Array(n), new Float32Array(n),
+            new Int32Array(n),
+        ];
         out.constructMs = Number(process.hrtime.bigint() - t0) / 1e6;
-        out.laneLen = e.x.length;
-        out.maxField = e.max;
+        out.laneLen = lanes[0].length;
 
         if (touch) {
             const t1 = process.hrtime.bigint();
             // Write a position-dependent value into EVERY slot of EVERY lane,
             // then read it back. Reserved-but-unfaulted address space cannot
             // survive this; a lane that silently truncates cannot either.
-            const lanes = [e.x, e.y, e.vx, e.vy, e.life, e.invLife, e.data];
             for (const lane of lanes) {
                 for (let i = 0; i < lane.length; i++) lane[i] = (i & 1023) + 1;
             }
@@ -106,7 +134,35 @@ if (process.env.CEILING_CHILD !== undefined) {
         out.rssDeltaBytes = m.rss - rss0;
         out.arrayBuffersBytes = m.arrayBuffers;
         out.status = 'CONSTRUCTED';
-        e.destroy();
+
+        // C8 evidence: does the SHIPPED constructor agree with this sweep? Only
+        // asked at the candidate, and only after the raw lanes already proved the
+        // size is real -- so a disagreement means the library's cap drifted from
+        // the measured evidence, not that the allocator failed.
+        if (process.env.CEILING_DOOR === '1') {
+            const mod = await import('../SoaParticleEngine.js');
+            out.moduleMax = mod.MAX_PARTICLES;
+            let e = null;
+            try {
+                e = new mod.SoaParticleEngine(n);
+                out.doorAccepts = e.x.length === n;
+            } catch (err) {
+                out.doorAccepts = false;
+                out.doorAcceptErr = String(err && err.message);
+            } finally {
+                if (e) e.destroy();
+            }
+            try {
+                const over = new mod.SoaParticleEngine(n + 1);
+                over.destroy();
+                out.doorRejectsOver = false;
+            } catch (err) {
+                out.doorRejectsOver = err instanceof RangeError &&
+                    /^SoaParticleEngine: /.test(String(err.message));
+                out.doorRejectErr = String(err && err.message);
+            }
+        }
+        lanes.length = 0;
     } catch (err) {
         out.status = 'THREW';
         out.errName = err && err.constructor ? err.constructor.name : String(err);
@@ -122,9 +178,14 @@ const freeBytes = os.freemem();
 /** Do not touch a footprint we cannot hold: swapping is not a measurement. */
 const TOUCH_LIMIT_BYTES = Math.max(0, freeBytes * 0.45);
 
-function runOne(n, touch) {
+function runOne(n, touch, door) {
     const r = spawnSync(process.execPath, [SELF], {
-        env: { ...process.env, CEILING_CHILD: String(n), CEILING_TOUCH: touch ? '1' : '0' },
+        env: {
+            ...process.env,
+            CEILING_CHILD: String(n),
+            CEILING_TOUCH: touch ? '1' : '0',
+            CEILING_DOOR: door ? '1' : '0',
+        },
         encoding: 'utf8',
         timeout: 120000,
         maxBuffer: 1 << 20,
@@ -178,7 +239,7 @@ const rows = [];
 for (const n of sizes) {
     const footprint = n * BYTES_PER_PARTICLE;
     const touch = footprint <= TOUCH_LIMIT_BYTES;
-    const r = runOne(n, touch);
+    const r = runOne(n, touch, n === CANDIDATE);
     r.footprint = footprint;
     rows.push(r);
 
@@ -224,10 +285,14 @@ const checks = [
         (cand.constructMs + (cand.touchMs || 0)) <= TIME_BUDGET_MS,
         cand && cand.constructMs !== undefined
             ? (cand.constructMs + (cand.touchMs || 0)).toFixed(0) + ' ms' : 'n/a'],
+    // An unobserved abort is NOT evidence of margin -- it means the sweep never
+    // reached the failure mode, so there is nothing to be 128x below. C5 must
+    // fail in that case rather than pass on Infinity / CANDIDATE >= MARGIN.
     ['C5 candidate >= ' + MARGIN + 'x below abort threshold',
-        abortThreshold / CANDIDATE >= MARGIN,
+        abortThreshold !== Infinity && abortThreshold / CANDIDATE >= MARGIN,
         abortThreshold === Infinity
-            ? 'no abort observed in sweep'
+            ? 'NO ABORT OBSERVED -- the sweep never reached the failure mode, so ' +
+              'there is no measured threshold to sit below'
             : 'abort at ' + pow2(abortThreshold) + ', margin ' + (abortThreshold / CANDIDATE).toFixed(0) + 'x'],
     ['C6 no catchable-failure band (cap is mandatory)',
         throwers.length === 0 && abortThreshold !== Infinity,
@@ -241,6 +306,18 @@ const checks = [
         (expectedRss <= PORTABILITY_BUDGET_BYTES ? 'fits' : 'OVER BUDGET') + '; ' +
         pow2(CANDIDATE * 2) + ' would need ' + mb(CANDIDATE * 2 * BYTES_PER_PARTICLE) + ' MB ' +
         (CANDIDATE * 2 * BYTES_PER_PARTICLE > PORTABILITY_BUDGET_BYTES ? '(over)' : '(ALSO FITS -- ceiling is too low)')],
+    // C1-C7 measure the ALLOCATOR through raw lanes. C8 is the only criterion
+    // that touches the shipped constructor, and it exists so the library's cap
+    // cannot drift away from the evidence in this file without a run turning red.
+    ['C8 shipped constructor enforces exactly this ceiling',
+        cand && cand.moduleMax === CANDIDATE &&
+        cand.doorAccepts === true && cand.doorRejectsOver === true,
+        cand && cand.moduleMax === undefined
+            ? 'door not probed (candidate row missing)'
+            : 'MAX_PARTICLES=' + (cand && pow2(cand.moduleMax)) +
+              (cand && cand.moduleMax !== CANDIDATE ? ' != candidate ' + pow2(CANDIDATE) + ' -- DRIFT' : '') +
+              '; accepts n=' + (cand && cand.doorAccepts) +
+              ', rejects n+1 with a branded RangeError=' + (cand && cand.doorRejectsOver)],
 ];
 
 console.log('');
@@ -248,7 +325,7 @@ console.log('VERDICT for MAX_PARTICLES = ' + pow2(CANDIDATE));
 let allOk = true;
 for (const [label, ok, detail] of checks) {
     if (!ok) allOk = false;
-    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + label.padEnd(48) + detail);
+    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + label.padEnd(54) + detail);
 }
 console.log('');
 if (allOk) {

@@ -3,6 +3,101 @@
 All notable changes to `@zakkster/lite-soa-particle-engine` are documented here.
 The format follows Keep a Changelog; this project uses semantic versioning.
 
+## [1.0.4] - 2026-08-15
+
+The door. Seven silent-corruption findings were one bug in seven costumes:
+nothing was validated at any entry point, so a value that could not possibly be
+correct was accepted, written into a lane, and surfaced much later as an
+invisible particle, a `NaN` alpha, or an engine that accepted emits forever and
+stored nothing. The policy is recorded in `decisions/0002-the-door.md`.
+
+The split: **the constructor throws, `emit()` never does.** The constructor runs
+once and a bad argument there is a programming error worth surfacing loudly;
+`emit()` runs per particle per frame and a throw inside a render loop is a crash.
+
+### Fixed
+- **P-03 / P-18 -- the constructor accepted arguments that cannot make an
+  engine.** `new SoaParticleEngine(2.5)` built lanes of length 2 with `max` 2.5;
+  `'10'` produced a string `max`; `0`, `NaN` and `null` produced zero-length
+  lanes. All now throw a named error (`TypeError` for non-numbers, `RangeError`
+  for out-of-range numbers) that states the package, the argument, the
+  constraint and the received value -- never the allocator's bare
+  `RangeError: Invalid typed array length`.
+- **P-04 -- `_head` could become `NaN` permanently.** One `emit()` into a
+  zero-length engine set `_head = 0 % 0 = NaN`, after which every emit was a
+  silent no-op forever. Dead by construction now: a validated `max` makes
+  `(i + 1) % max` unable to produce `NaN`. No code of its own; the test proves it
+  is unreachable.
+- **P-05 / P-17 -- `life` was accepted at both ends of the f32 range where it
+  corrupts.** `emit(..., life = 1e-46)` stored `life` 0 and `invLife`
+  `Infinity`, making the documented `life[i] * invLife[i]` alpha `NaN`; above
+  `LIFE_MAX`, `life` itself stored as `Infinity`. `emit()` now rejects any
+  `life` outside `[LIFE_MIN, LIFE_MAX]`.
+- **P-06 -- `dataFlag` was whatever `Int32Array` happened to do.** `3.7 -> 3`,
+  `2**31 -> -2147483648`, `NaN -> 0`, `'x' -> 0`, `null -> 0`, all silent. That
+  is not a policy. `emit()` now rejects any flag that is not an exact int32.
+  `0` remains the default and is a legal recipe id.
+- **P-02 -- the dt "cap" did not clamp, it fabricated.** `if (dt > 0.1) dt =
+  0.016;` reported a 101 ms frame and a 5000 ms frame to the caller as identical
+  16 ms frames. Replaced with a real clamp to `maxDt`.
+
+### Added
+- `MAX_PARTICLES` export (`2**24` = 16777216), the `maxParticles` ceiling.
+  Proven, not asserted: `npm run bench:ceiling` is a falsifiable eight-criterion
+  gate whose pass condition was written before the numbers, and it rejects wrong
+  candidates in both directions (`2**25` and `2**30` too high, `2**20` too low).
+  The load-bearing criterion is C6: **there is no size at which the lane
+  allocator fails politely.** `2**33` does not throw, it kills the process
+  (exit 133, uncatchable), so a `try/catch` cannot save a caller and validation
+  is the only guard between a typo and a dead process.
+- `LIFE_MIN` (`2.938735964636876e-39`) and `LIFE_MAX`
+  (`3.4028235677973362e+38`) exports -- both **measured** f32 boundaries, not
+  analytic ones. The analytic `1 / F32MAX` is `2.938736052218037e-39`, which is
+  *larger* than the true boundary and would silently reject a band of perfectly
+  legal lifetimes.
+- `options.maxDt` constructor option (default `0.1`), validated at the door.
+- `test/bench-ceiling.mjs` and `test/bench-emit.mjs`, with `npm run
+  bench:ceiling`, `bench:emit` and `bench:emit:selftest`. Test-only; neither
+  ships.
+
+### Changed
+- **Breaking for callers passing garbage to the constructor.** 1.0.3 accepted
+  `2.5`, `'10'`, `null`, `NaN` and `0`; 1.0.4 throws on all five. Every one of
+  them produced an engine that could not work, so the affected callers are
+  already broken and do not know it. Shipped as a patch for that reason, and
+  called out here regardless.
+- A clamped frame **loses time by design** -- the alternative is a physics step
+  so large that particles tunnel. This engine is not a fixed-step simulator; a
+  caller needing an accumulator drives the step themselves.
+- `clear()` is **life-only by contract**, now stated rather than implied: it
+  zeroes `life` and resets the write cursor and does not touch
+  `x/y/vx/vy/invLife/data`. For a slot with `life[i] <= 0` those six lanes are
+  undefined and must not be read.
+- The seven lanes are **reassigned only by `destroy()`**, now stated in the
+  contract.
+
+### Performance
+`emit()` gains exactly one net comparison: the `dataFlag` int32 test. The `life`
+band test `!(life >= LIFE_MIN && life <= LIFE_MAX)` *replaces* the old
+`!Number.isFinite(life) || life <= 0` pair -- written with the negation outside,
+one range test also rejects `NaN`, both infinities, `0` and negatives.
+
+Measured with `npm run bench:emit` (Apple M4 Pro, node v26.3.1, 51 interleaved
+pairs against the frozen 1.0.3 baseline): **+0.3% against that run's own
+resolution limit of R = 6.4%.** That is below resolution, so this release makes
+**no throughput claim in either direction** -- "no measurable change" is the
+result, and a number smaller than the noise that produced it is not. The harness
+reports R on every run and refuses to publish a delta it cannot resolve;
+`npm run bench:emit:selftest` is the control proving it can correctly call two
+identical implementations indistinguishable.
+
+### Testing
+24 -> 98 `node:test` cases. Every one of the nine findings has a named test that
+fails against 1.0.3 and passes here. Torture tier T1 was inverted from pinning
+the old buggy behaviour to asserting the new contract, T4 gained the lifecycle-
+abuse matrix, and T9 gained a control that reverts the dt clamp to the 0.016
+fabrication and must fail T1.
+
 ## [1.0.3] - 2026-08-15
 
 Packaging honesty, `node:test` port, and the torture skeleton. **Zero behaviour

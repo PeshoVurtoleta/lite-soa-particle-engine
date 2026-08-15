@@ -1,4 +1,4 @@
-# @zakkster/lite-soa-particle-engine v1.0.3
+# @zakkster/lite-soa-particle-engine v1.0.4
 
 > Zero-GC canvas particle system using Structure of Arrays. Ring buffer, flat TypedArrays, raw array access.
 
@@ -10,10 +10,21 @@ None (standalone)
 
 ## Exports
 - `SoaParticleEngine` -- Class
-- `VERSION` -- string ('1.0.3')
+- `VERSION` -- string ('1.0.4')
+- `MAX_PARTICLES` -- number (2**24 = 16777216), the maxParticles ceiling
+- `LIFE_MIN` -- number (2.938735964636876e-39), low end of the legal life band
+- `LIFE_MAX` -- number (3.4028235677973362e+38), high end of the legal life band
 
 ## Constructor
-`new SoaParticleEngine(maxParticles?)`  -- Default: 1000. All memory allocated once.
+`new SoaParticleEngine(maxParticles?, options?)`  -- Default: 1000. All memory allocated once.
+THROWS a named error rather than constructing an unusable engine:
+- `maxParticles` not a number -> TypeError `SoaParticleEngine: maxParticles must be a number, got ...`
+- `maxParticles` not an integer in [1, MAX_PARTICLES] -> RangeError naming the value.
+  Rejects 0, 2.5, NaN, -1, Infinity, '10', null and anything above the ceiling.
+- `options.maxDt` (default 0.1) must be a finite number > 0 or the constructor throws.
+The lane allocator has no polite-failure size -- a large enough request kills the
+process instead of throwing -- so this validation is the only guard between a
+caller's typo and a dead process. See decisions/0002-the-door.md.
 
 ## TypedArray Fields
 - `x, y, vx, vy` -- Float32Array (position + velocity)

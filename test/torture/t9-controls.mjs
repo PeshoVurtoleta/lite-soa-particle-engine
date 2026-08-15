@@ -88,4 +88,36 @@ export function run() {
         if (e._head !== 1) die('T9 control: a rejected emit advanced the head');
         e.destroy();
     }
+
+    // Control 5 -- the P-02 dt clamp law. T1 asserts "a gap > maxDt clamps to
+    // EXACTLY maxDt". Prove that law CATCHES the reverted rule: apply the old
+    // 0.016-fabrication as a local function and assert the T1 predicate (a 101 ms
+    // gap yields maxDt) is FALSE for it, then TRUE for the real engine. A law the
+    // buggy rule passes is decorative.
+    {
+        const maxDt = 0.1;
+        const oldRule = (gapMs) => { let dt = gapMs / 1000; if (dt > 0.1) dt = 0.016; return dt; };
+        // Old rule on a 101 ms gap fabricates 0.016, so the T1 predicate is false.
+        if (oldRule(101) === maxDt) die('T9 control: the reverted 0.016 dt rule passed the T1 clamp law (the law cannot catch P-02)');
+
+        const e = new SoaParticleEngine(4);
+        let dt = NaN;
+        e.onTick((d) => { dt = d; });
+        e._isRunning = true;
+        e._lastTime = 0;
+        e._loop(101);
+        e.destroy();
+        if (dt !== maxDt) die('T9 control: the real engine failed the T1 clamp law on a 101 ms gap (dt=' + dt + ')');
+    }
+
+    // Control 6 -- the constructor-validation law is not vacuous. T1 asserts every
+    // garbage arg throws; prove a VALID arg does NOT throw, so the law is a real
+    // property and not a constructor that throws on everything.
+    {
+        let threw = false;
+        let e = null;
+        try { e = new SoaParticleEngine(16); } catch { threw = true; }
+        if (threw) die('T9 control: a valid maxParticles (16) threw (the ctor-validation law would be vacuous)');
+        if (e) e.destroy();
+    }
 }

@@ -74,26 +74,84 @@ canvas.addEventListener('click', (e) => {
 
 ## API
 
-### `new SoaParticleEngine(maxParticles?)`
+### `new SoaParticleEngine(maxParticles?, options?)`
 
 Allocates all memory once. Default: 1000 particles.
+
+`maxParticles` must be an integer in `[1, MAX_PARTICLES]` (`MAX_PARTICLES` is
+`2**24` = 16777216, exported). Anything else **throws** a named error rather than
+constructing an engine that cannot work:
+
+```javascript
+new SoaParticleEngine(2.5);    // RangeError: SoaParticleEngine: maxParticles must be an integer in [1, 16777216], got 2.5
+new SoaParticleEngine(0);      // RangeError -- a zero-length engine silently swallows every emit
+new SoaParticleEngine('10');   // TypeError:  SoaParticleEngine: maxParticles must be a number, got string "10"
+```
+
+There is no size at which the lane allocator fails politely -- a large enough
+request kills the process outright rather than throwing -- so this validation is
+the only thing between a typo and a dead process. See
+`decisions/0002-the-door.md`.
+
+`options.maxDt` (default `0.1`) is the largest frame delta the loop passes to
+`onTick`. It must be a finite number greater than 0 or the constructor throws.
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
-| `.emit(x, y, vx, vy, life, dataFlag?)` | Emit a particle at the ring write cursor. When full it overwrites the slot at the cursor, alive or not (see Ring Buffer Behavior). |
+| `.emit(x, y, vx, vy, life, dataFlag?)` | Emit a particle at the ring write cursor. Never throws -- silently rejects anything it cannot store (see Input Contract). When full it overwrites the slot at the cursor, alive or not (see Ring Buffer Behavior). |
 | `.onTick(callback)` | Register the frame callback. Receives raw TypedArrays. |
 | `.start()` | Start the RAF loop. |
 | `.stop()` / `.pause()` | Stop the RAF loop. |
-| `.clear()` | Kill all particles. |
+| `.clear()` | Kill all particles: zeroes the `life` lane only (see Input Contract). |
 | `.destroy()` | Stop and release all TypedArray memory. |
+
+## Input Contract
+
+The constructor throws; `emit()` never does. That split is deliberate: the
+constructor runs once and a bad argument there is a programming error worth
+surfacing loudly, while `emit()` runs per particle per frame and a throw inside a
+render loop is a crash.
+
+**`emit()` silently rejects**, before touching any lane, and returns without
+advancing the write cursor:
+
+- non-finite `x`, `y`, `vx` or `vy`;
+- `life` outside `[LIFE_MIN, LIFE_MAX]` -- which also covers `NaN`, both
+  infinities, `0` and negatives;
+- a `dataFlag` that is not an exact int32.
+
+A rejected `emit()` leaves the engine byte-identical.
+
+`LIFE_MIN` (`2.938735964636876e-39`) and `LIFE_MAX` (`3.4028235677973362e+38`)
+are exported, and both are **measured** f32 boundaries. Below `LIFE_MIN`,
+`1/life` overflows f32 and `invLife` becomes `Infinity`, making the documented
+`life[i] * invLife[i]` alpha `NaN`; above `LIFE_MAX`, `life` itself stores as
+`Infinity`. Both ends silently corrupted a particle in earlier versions.
+
+Because both lanes are f32, alpha at birth is `1` only to within one f32 ulp:
+the measured worst case across the legal band is `|alpha - 1| = 2.31e-7`. Clamp
+if you need exactly `[0, 1]`, as the Quick Start does with `Math.max`.
+
+**Dead slots hold undefined data.** `clear()` zeroes `life` and resets the write
+cursor; it does not touch `x/y/vx/vy/invLife/data`. For any slot where
+`life[i] <= 0`, treat those six lanes as meaningless -- the liveness test is
+`life[i] <= 0` and nothing else.
+
+**The lanes are reassigned only by `destroy()`**, which sets all seven to `null`.
+No other method replaces a lane.
+
+**A clamped frame loses time by design.** A gap larger than `maxDt` is clamped to
+`maxDt` and the excess is dropped, because the alternative is a physics step so
+large that particles tunnel. This engine is therefore not a fixed-step simulator;
+a caller needing an accumulator should drive the step themselves.
 
 ### The `onTick` Callback
 
 ```javascript
 engine.onTick((dt, x, y, vx, vy, life, invLife, data, max) => {
-    // dt: seconds since last frame (capped at 0.1)
+    // dt: seconds since last frame, clamped to maxDt (default 0.1)
     // x, y: Float32Array positions
     // vx, vy: Float32Array velocities
     // life: Float32Array remaining life
