@@ -26,4 +26,6 @@ export class SoaParticleEngine {
     destroy(): void;
 }
 
+export const VERSION: string;
+
 export default SoaParticleEngine;

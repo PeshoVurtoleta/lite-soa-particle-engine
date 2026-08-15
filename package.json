@@ -1,11 +1,12 @@
 {
   "name": "@zakkster/lite-soa-particle-engine",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Zero-GC canvas particle system using Structure of Arrays and flat TypedArrays. CPU cache-friendly.",
   "type": "module",
   "main": "SoaParticleEngine.js",
   "types": "SoaParticleEngine.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./SoaParticleEngine.d.ts",
@@ -16,8 +17,19 @@
   "files": [
     "SoaParticleEngine.js",
     "SoaParticleEngine.d.ts",
-    "README.md"
+    "README.md",
+    "llms.txt",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
   "homepage": "https://github.com/PeshoVurtoleta/lite-soa-particle-engine#readme",
   "repository": {
@@ -37,5 +49,9 @@
     "game",
     "performance",
     "cache-friendly"
-  ]
+  ],
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.15.0",
+    "@zakkster/lite-leak": "^1.8.1"
+  }
 }

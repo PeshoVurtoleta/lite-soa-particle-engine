@@ -1,16 +1,21 @@
 /**
- * @zakkster/lite-soa-particle-engine — Zero-GC Canvas Particle System
+ * @zakkster/lite-soa-particle-engine -- Zero-GC Canvas Particle System
  *
  * Uses Structure of Arrays (SoA) to maintain particles in flat TypedArrays.
  * CPU cache-friendly: iterating a Float32Array is ~10x faster than iterating
  * an array of objects because the data is contiguous in memory.
  *
- * Ring buffer design: when the pool is full, new particles overwrite the oldest.
- * This is intentional — graceful visual degradation without crashes or GC spikes.
+ * Ring buffer design: when the pool is full, emit() overwrites the slot at the
+ * write cursor whether or not it is still alive. With mixed lifetimes that slot
+ * is frequently NOT the oldest particle, so a long-lived particle can be stomped
+ * while dead slots sit free (finding P-01; a liveness-aware policy lands in S4).
+ * Graceful visual degradation without crashes or GC spikes.
  *
  * The engine owns the RAF loop and exposes raw arrays to the onTick callback
  * for maximum rendering flexibility.
  */
+
+export const VERSION = '1.0.3';
 
 export class SoaParticleEngine {
     /**
@@ -19,7 +24,7 @@ export class SoaParticleEngine {
     constructor(maxParticles = 1000) {
         this.max = maxParticles;
 
-        // Allocate all memory once — zero allocations during gameplay
+        // Allocate all memory once -- zero allocations during gameplay
         this.x       = new Float32Array(this.max);
         this.y       = new Float32Array(this.max);
         this.vx      = new Float32Array(this.max);
@@ -41,8 +46,10 @@ export class SoaParticleEngine {
     /**
      * Emit a single particle.
      *
-     * Ring buffer: if the pool is full, the oldest particle is overwritten.
-     * This is intentional — visual degradation without crashes.
+     * Ring buffer: when the pool is full, emit() overwrites the slot at the write
+     * cursor whether or not it is alive; with mixed lifetimes that is frequently
+     * not the oldest particle (finding P-01, fixed in S4). Visual degradation
+     * without crashes.
      *
      * @param {number} x        X position
      * @param {number} y        Y position
@@ -77,7 +84,7 @@ export class SoaParticleEngine {
      *
      * @param {Function} callback (dt, x, y, vx, vy, life, invLife, data, max)
      *   dt: seconds since last frame
-     *   x..data: the raw TypedArrays — mutate them directly
+     *   x..data: the raw TypedArrays -- mutate them directly
      *   max: array length
      */
     onTick(callback) {

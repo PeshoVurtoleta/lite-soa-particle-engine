@@ -12,24 +12,20 @@ Zero-GC canvas particle system using Structure of Arrays (SoA) and flat TypedArr
 
 **The fastest way to move thousands of dots on a Canvas. No objects. No GC. No mercy.**
 
-## 🎬 Live Demo (SoaParticleEngine)
+## Live Demo (SoaParticleEngine)
 https://codepen.io/Zahari-Shinikchiev/debug/gbwmWvJ
 
 ## Performance
 
-| Library / Engine | Allocations per Frame | Avg Frame Time (ms) | GC Events (10s) | Deterministic | Notes |
-|---|---|---|---|---|---|
-| **Lite SoA Engine** | **0** | **1.2** | **0** | **Yes** | **Flat arrays, no objects** |
-| pixi-particles | ~3,000 | 4.8 | 2–3 | No | Object churn |
-| tsparticles | ~5,000 | 7.2 | 4–6 | No | Heavy object creation |
-| Vanilla OOP Particles | ~100,000 | 12–20 | 10+ | No | Each particle = object |
-| three.js GPU Particles | 0 | 0.8 | 0 | No | Fast but non-deterministic |
+A stamped, reproducible benchmark (machine + Node + version provenance, with a
+runnable script) lands in S6. Until then this README makes no numeric performance
+claim.
 
 ### Why SoA is faster
 
-Traditional particle systems store each particle as an object: `{ x, y, vx, vy, life }`. When you loop over 10,000 particles, the CPU fetches each object from a random memory location — **cache miss after cache miss**.
+Traditional particle systems store each particle as an object: `{ x, y, vx, vy, life }`. When you loop over 10,000 particles, the CPU fetches each object from a random memory location -- **cache miss after cache miss**.
 
-SoA stores each property in a contiguous `Float32Array`. When you loop over `x[0], x[1], x[2]...`, the data is sequential in memory — the CPU prefetcher loads it all into L1 cache in one shot. **10x fewer cache misses** for tight physics loops.
+SoA stores each property in a contiguous `Float32Array`. When you loop over `x[0], x[1], x[2]...`, the data is sequential in memory -- the CPU prefetcher loads it all into L1 cache in one shot. **10x fewer cache misses** for tight physics loops.
 
 ## Installation
 
@@ -86,7 +82,7 @@ Allocates all memory once. Default: 1000 particles.
 
 | Method | Description |
 |--------|-------------|
-| `.emit(x, y, vx, vy, life, dataFlag?)` | Emit a particle. Ring buffer overwrites oldest when full. |
+| `.emit(x, y, vx, vy, life, dataFlag?)` | Emit a particle at the ring write cursor. When full it overwrites the slot at the cursor, alive or not (see Ring Buffer Behavior). |
 | `.onTick(callback)` | Register the frame callback. Receives raw TypedArrays. |
 | `.start()` | Start the RAF loop. |
 | `.stop()` / `.pause()` | Stop the RAF loop. |
@@ -101,11 +97,11 @@ engine.onTick((dt, x, y, vx, vy, life, invLife, data, max) => {
     // x, y: Float32Array positions
     // vx, vy: Float32Array velocities
     // life: Float32Array remaining life
-    // invLife: Float32Array (1/initialLife) — multiply for normalized progress
-    // data: Int32Array — recipe IDs or custom flags
+    // invLife: Float32Array (1/initialLife) -- multiply for normalized progress
+    // data: Int32Array -- recipe IDs or custom flags
     // max: array length
     //
-    // MUTATE THESE DIRECTLY — that's the whole point
+    // MUTATE THESE DIRECTLY -- that's the whole point
 });
 ```
 
@@ -179,7 +175,7 @@ function explode(x, y) {
 
 ## Ring Buffer Behavior
 
-When the pool is full, `emit()` overwrites the oldest particle. This is intentional — visual degradation without crashes, allocations, or GC pauses. Under extreme load, older particles disappear slightly early rather than the frame rate dropping.
+`emit()` writes at an internal write cursor and advances it by one, wrapping at `max`. When the pool is full it overwrites the slot at the cursor **whether or not that slot is still alive** -- it does not search for the oldest or a dead slot. With mixed lifetimes the cursor slot is frequently not the oldest particle, so a long-lived particle can be overwritten while dead slots sit free. The upside is bounded, allocation-free, GC-free behaviour under extreme load: emission never crashes and never stalls the frame. A liveness-aware overwrite policy is planned (tracked as finding P-01); until it ships, the write-cursor overwrite above is the exact documented contract.
 
 ## TypeScript
 

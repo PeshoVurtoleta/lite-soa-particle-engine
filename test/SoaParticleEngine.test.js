@@ -1,36 +1,41 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
 import { SoaParticleEngine } from '../SoaParticleEngine.js';
+import { installFramePump } from './helpers/env.mjs';
 
-describe('⚡ SoaParticleEngine', () => {
+describe('SoaParticleEngine', () => {
     let engine;
+    let pump;
 
     beforeEach(() => {
-        vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 1);
-        vi.spyOn(globalThis, 'cancelAnimationFrame').mockImplementation(() => {});
-        vi.spyOn(performance, 'now').mockReturnValue(0);
+        // Deterministic RAF + clock shims, driven by explicit timestamps only
+        // (replacing the old spies on requestAnimationFrame / cancelAnimationFrame
+        // / performance.now). See finding P-08; the loop-ownership fix is S3.
+        pump = installFramePump();
+        pump.setNow(0);
         engine = new SoaParticleEngine(100);
     });
 
     afterEach(() => {
         engine?.destroy();
-        vi.restoreAllMocks();
+        pump.uninstall();
     });
 
     describe('constructor', () => {
         it('allocates Float32Arrays', () => {
-            expect(engine.x).toBeInstanceOf(Float32Array);
-            expect(engine.y).toBeInstanceOf(Float32Array);
-            expect(engine.life).toBeInstanceOf(Float32Array);
-            expect(engine.x.length).toBe(100);
+            assert.ok(engine.x instanceof Float32Array);
+            assert.ok(engine.y instanceof Float32Array);
+            assert.ok(engine.life instanceof Float32Array);
+            assert.equal(engine.x.length, 100);
         });
 
         it('allocates Int32Array for data', () => {
-            expect(engine.data).toBeInstanceOf(Int32Array);
+            assert.ok(engine.data instanceof Int32Array);
         });
 
         it('defaults to 1000 particles', () => {
             const e = new SoaParticleEngine();
-            expect(e.max).toBe(1000);
+            assert.equal(e.max, 1000);
             e.destroy();
         });
     });
@@ -38,23 +43,23 @@ describe('⚡ SoaParticleEngine', () => {
     describe('emit()', () => {
         it('writes particle data to current head position', () => {
             engine.emit(10, 20, 30, 40, 1.5, 7);
-            expect(engine.x[0]).toBe(10);
-            expect(engine.y[0]).toBe(20);
-            expect(engine.vx[0]).toBe(30);
-            expect(engine.vy[0]).toBe(40);
-            expect(engine.life[0]).toBe(1.5);
-            expect(engine.data[0]).toBe(7);
+            assert.equal(engine.x[0], 10);
+            assert.equal(engine.y[0], 20);
+            assert.equal(engine.vx[0], 30);
+            assert.equal(engine.vy[0], 40);
+            assert.equal(engine.life[0], Math.fround(1.5));
+            assert.equal(engine.data[0], 7);
         });
 
         it('computes invLife', () => {
             engine.emit(0, 0, 0, 0, 2.0);
-            expect(engine.invLife[0]).toBeCloseTo(0.5);
+            assert.ok(Math.abs(engine.invLife[0] - 0.5) < 1e-6);
         });
 
         it('advances head (ring buffer)', () => {
             engine.emit(0, 0, 0, 0, 1);
             engine.emit(0, 0, 0, 0, 1);
-            expect(engine._head).toBe(2);
+            assert.equal(engine._head, 2);
         });
 
         it('wraps around at max', () => {
@@ -62,98 +67,105 @@ describe('⚡ SoaParticleEngine', () => {
             e.emit(1, 0, 0, 0, 1);
             e.emit(2, 0, 0, 0, 1);
             e.emit(3, 0, 0, 0, 1);
-            e.emit(4, 0, 0, 0, 1); // overwrites slot 0
-            expect(e.x[0]).toBe(4);
-            expect(e._head).toBe(1);
+            e.emit(4, 0, 0, 0, 1); // overwrites slot at the write cursor (slot 0)
+            assert.equal(e.x[0], 4);
+            assert.equal(e._head, 1);
             e.destroy();
         });
 
         it('rejects NaN values', () => {
             engine.emit(NaN, 0, 0, 0, 1);
-            expect(engine.life[0]).toBe(0); // unchanged
+            assert.equal(engine.life[0], 0); // unchanged
         });
 
         it('rejects non-finite values', () => {
             engine.emit(Infinity, 0, 0, 0, 1);
-            expect(engine.life[0]).toBe(0);
+            assert.equal(engine.life[0], 0);
         });
 
         it('rejects life <= 0', () => {
             engine.emit(0, 0, 0, 0, 0);
-            expect(engine.life[0]).toBe(0);
+            assert.equal(engine.life[0], 0);
             engine.emit(0, 0, 0, 0, -1);
-            expect(engine.life[0]).toBe(0);
+            assert.equal(engine.life[0], 0);
         });
 
         it('is no-op after destroy', () => {
             engine.destroy();
-            expect(() => engine.emit(0, 0, 0, 0, 1)).not.toThrow();
+            assert.doesNotThrow(() => engine.emit(0, 0, 0, 0, 1));
         });
     });
 
     describe('start/stop', () => {
         it('start() requests animation frame', () => {
             engine.start();
-            expect(requestAnimationFrame).toHaveBeenCalled();
-            expect(engine._isRunning).toBe(true);
+            assert.ok(pump.rafCalls > 0);
+            assert.equal(engine._isRunning, true);
         });
 
         it('start() is idempotent', () => {
             engine.start();
-            const calls = requestAnimationFrame.mock.calls.length;
+            const calls = pump.rafCalls;
             engine.start();
-            expect(requestAnimationFrame.mock.calls.length).toBe(calls);
+            assert.equal(pump.rafCalls, calls);
         });
 
         it('stop() cancels animation frame', () => {
             engine.start();
             engine.stop();
-            expect(engine._isRunning).toBe(false);
+            assert.equal(engine._isRunning, false);
         });
 
         it('pause() is alias for stop()', () => {
             engine.start();
             engine.pause();
-            expect(engine._isRunning).toBe(false);
+            assert.equal(engine._isRunning, false);
         });
 
         it('start() is no-op after destroy', () => {
             engine.destroy();
             engine.start();
-            expect(engine._isRunning).toBe(false);
+            assert.equal(engine._isRunning, false);
         });
     });
 
     describe('onTick()', () => {
         it('registers callback', () => {
-            const fn = vi.fn();
+            const fn = () => {};
             engine.onTick(fn);
-            expect(engine._onTick).toBe(fn);
+            assert.equal(engine._onTick, fn);
         });
     });
 
     describe('_loop()', () => {
         it('calls onTick with raw arrays', () => {
-            const fn = vi.fn();
-            engine.onTick(fn);
+            const calls = [];
+            engine.onTick((...args) => calls.push(args));
             engine.start();
             engine._loop(16.66);
-            expect(fn).toHaveBeenCalledWith(
-                expect.any(Number),
-                engine.x, engine.y, engine.vx, engine.vy,
-                engine.life, engine.invLife, engine.data,
-                engine.max
-            );
+            assert.equal(calls.length, 1);
+            const a = calls[0];
+            assert.equal(typeof a[0], 'number');
+            assert.equal(a[1], engine.x);
+            assert.equal(a[2], engine.y);
+            assert.equal(a[3], engine.vx);
+            assert.equal(a[4], engine.vy);
+            assert.equal(a[5], engine.life);
+            assert.equal(a[6], engine.invLife);
+            assert.equal(a[7], engine.data);
+            assert.equal(a[8], engine.max);
         });
 
         it('caps dt on lag spikes', () => {
-            const fn = vi.fn();
-            engine.onTick(fn);
+            let dt;
+            engine.onTick((d) => { dt = d; });
             engine._lastTime = 0;
             engine._isRunning = true;
             engine._loop(5000); // 5 second gap
-            const dt = fn.mock.calls[0][0];
-            expect(dt).toBeCloseTo(0.016);
+            // Pinned: the current cap fabricates a 60Hz frame instead of clamping
+            // (finding P-02). It reports 0.016 for ANY gap > 100ms. S2 changes this
+            // to a real maxDt clamp; until then this is the documented behaviour.
+            assert.ok(Math.abs(dt - 0.016) < 1e-6);
         });
     });
 
@@ -162,28 +174,28 @@ describe('⚡ SoaParticleEngine', () => {
             engine.emit(0, 0, 0, 0, 1);
             engine.emit(0, 0, 0, 0, 2);
             engine.clear();
-            expect(engine.life[0]).toBe(0);
-            expect(engine.life[1]).toBe(0);
+            assert.equal(engine.life[0], 0);
+            assert.equal(engine.life[1], 0);
         });
 
         it('resets head', () => {
             engine.emit(0, 0, 0, 0, 1);
             engine.clear();
-            expect(engine._head).toBe(0);
+            assert.equal(engine._head, 0);
         });
     });
 
     describe('destroy()', () => {
         it('nulls all arrays', () => {
             engine.destroy();
-            expect(engine.x).toBeNull();
-            expect(engine.life).toBeNull();
-            expect(engine.data).toBeNull();
+            assert.equal(engine.x, null);
+            assert.equal(engine.life, null);
+            assert.equal(engine.data, null);
         });
 
         it('is idempotent', () => {
             engine.destroy();
-            expect(() => engine.destroy()).not.toThrow();
+            assert.doesNotThrow(() => engine.destroy());
         });
     });
 });
