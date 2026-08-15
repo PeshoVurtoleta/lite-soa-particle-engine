@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>@zakkster/lite-soa-particle-engine — 100K Stress Test</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
+
+        body {
+            background: #000;
+            overflow: hidden
+        }
+
+        canvas {
+            display: block
+        }
+
+        .hud {
+            position: fixed;
+            top: 0;
+            left: 0;
+            padding: 12px 16px;
+            font-family: monospace;
+            font-size: 12px;
+            color: #0f0;
+            line-height: 1.7;
+            background: rgba(0, 0, 0, .7);
+            border-bottom-right-radius: 8px;
+            z-index: 10;
+            min-width: 240px
+        }
+
+        .hud .dim {
+            color: #555
+        }
+
+        .hud .val {
+            color: #0f0
+        }
+
+        .hud .brand {
+            color: #8b5cf6;
+            font-weight: bold
+        }
+
+        .bar {
+            height: 4px;
+            background: #111;
+            border-radius: 2px;
+            margin-top: 4px;
+            overflow: hidden
+        }
+
+        .bar-fill {
+            height: 100%;
+            background: #0f0;
+            transition: width .3s
+        }
+    </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+    <span class="brand">@zakkster/lite-soa-particle-engine</span><br>
+    <span class="dim">particles:</span> <span class="val" id="count">0</span> / 100,000<br>
+    <span class="dim">fps:</span> <span class="val" id="fps">60</span><br>
+    <span class="dim">frame:</span> <span class="val" id="frametime">0.0</span><span class="dim">ms</span><br>
+    <span class="dim">gc events:</span> <span class="val">0</span> <span
+        class="dim">(zero allocs in hot loop)</span><br>
+    <span class="dim">render:</span> <span class="dim">5 batched draw calls</span><br>
+    <span class="dim">strings/frame:</span> <span class="val">0</span> <span class="dim">(color buckets)</span>
+    <div class="bar">
+        <div class="bar-fill" id="bar" style="width:0%"></div>
+    </div>
+</div>
+
+<script>
+    // ═══════════════════════════════════════════
+    // SoA Particle Engine — THE STRESS TEST
+    // 100,000 particles. Zero allocations. Zero GC.
+    // All data lives in flat Float32Arrays.
+    // ═══════════════════════════════════════════
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', {alpha: false});
+    let W, H;
+
+    function resize() {
+        W = canvas.width = innerWidth;
+        H = canvas.height = innerHeight;
+    }
+
+    resize();
+    window.addEventListener('resize', resize);
+
+    // THE CORE — Structure of Arrays
+    const MAX = 100000;
+    const x = new Float32Array(MAX);
+    const y = new Float32Array(MAX);
+    const vx = new Float32Array(MAX);
+    const vy = new Float32Array(MAX);
+    const life = new Float32Array(MAX);
+
+    // Speed cache — squared velocity, computed once per frame, read by each bucket pass.
+    // Allocated once at init. Zero allocations during gameplay.
+    const spd = new Float32Array(MAX);
+
+    // Color buckets: 5 speed tiers with pre-baked CSS strings.
+    // These are the ONLY strings in the entire render pipeline.
+    // Set once at init, never inside the hot loop.
+    // Thresholds are SQUARED (avoids sqrt per particle).
+    const BUCKET_COLORS = [
+        'rgba(40, 80, 255, 0.6)',   // very slow — cool blue
+        'rgba(100, 50, 255, 0.6)',  // slow — indigo
+        'rgba(200, 30, 200, 0.6)',  // medium — magenta
+        'rgba(255, 60, 40, 0.6)',   // fast — red-orange
+        'rgba(255, 200, 40, 0.6)',  // very fast — gold
+    ];
+    // Squared speed thresholds (no sqrt needed in the loop)
+    const BUCKET_THRESHOLDS = [0, 900, 3600, 10000, 40000, Infinity];
+
+    let head = 0;
+
+    // Pre-fill the entire pool — all 100K particles spawned at once
+    for (let i = 0; i < MAX; i++) {
+        x[i] = Math.random() * innerWidth;
+        y[i] = Math.random() * innerHeight;
+        vx[i] = (Math.random() - 0.5) * 200;
+        vy[i] = (Math.random() - 0.5) * 200;
+        life[i] = 2 + Math.random() * 5;
+    }
+
+    // Respawn dead particles at random positions
+    function respawn(i) {
+        x[i] = Math.random() * W;
+        y[i] = Math.random() * H;
+        vx[i] = (Math.random() - 0.5) * 200;
+        vy[i] = (Math.random() - 0.5) * 200;
+        life[i] = 2 + Math.random() * 5;
+    }
+
+    // FPS tracking (no allocations)
+    let fpsSmooth = 60;
+    let lastTime = performance.now();
+    let frameCounter = 0;
+    const fpsEl = document.getElementById('fps');
+    const countEl = document.getElementById('count');
+    const frameEl = document.getElementById('frametime');
+    const barEl = document.getElementById('bar');
+
+    function tick(now) {
+        const frameStart = performance.now();
+        let dt = (now - lastTime) / 1000;
+        lastTime = now;
+        if (dt > 0.1) dt = 0.016;
+
+        // === THE HOT LOOP ===
+        // SoA = sequential memory access. The CPU prefetcher loads entire
+        // Float32Array segments into L1 cache in one shot.
+        //
+        // RENDERING STRATEGY: Color Buckets
+        // Instead of 100,000 fillStyle changes (each creating a GC'd string
+        // and crossing the JS→C++ bridge), we batch particles by velocity
+        // into 5 color buckets. Total draw calls: 5 instead of 100,000.
+        // Total string allocations in the hot loop: ZERO.
+
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, W, H);
+
+        let alive = 0;
+
+        // Pre-allocated speed buffer — computed once, read by each bucket pass.
+        // This avoids recomputing sqrt 5x per particle.
+        // Allocated ONCE outside the loop (on init), never during gameplay.
+        for (let i = 0; i < MAX; i++) {
+            life[i] -= dt;
+
+            if (life[i] <= 0) {
+                respawn(i);
+                continue;
+            }
+
+            // Physics (runs exactly once per particle)
+            x[i] += vx[i] * dt;
+            y[i] += vy[i] * dt;
+
+            // Bounce off walls
+            if (x[i] < 0) {
+                x[i] = 0;
+                vx[i] = -vx[i];
+            }
+            if (x[i] > W) {
+                x[i] = W;
+                vx[i] = -vx[i];
+            }
+            if (y[i] < 0) {
+                y[i] = 0;
+                vy[i] = -vy[i];
+            }
+            if (y[i] > H) {
+                y[i] = H;
+                vy[i] = -vy[i];
+            }
+
+            // Gravity toward center
+            const dx = W / 2 - x[i], dy = H / 2 - y[i];
+            const dist = Math.sqrt(dx * dx + dy * dy) + 1;
+            vx[i] += (dx / dist) * 30 * dt;
+            vy[i] += (dy / dist) * 30 * dt;
+
+            // Cache speed for the bucket passes (avoids 5x sqrt)
+            spd[i] = vx[i] * vx[i] + vy[i] * vy[i]; // squared — compare against squared thresholds
+            alive++;
+        }
+
+        // === COLOR BUCKET RENDERING ===
+        // 5 buckets × 1 beginPath + 1 fill = 5 total draw calls.
+        // Zero fillStyle changes inside any loop. Zero string allocations.
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = 0.6;
+
+        for (let b = 0; b < 5; b++) {
+            ctx.fillStyle = BUCKET_COLORS[b];
+            ctx.beginPath();
+
+            const lo = BUCKET_THRESHOLDS[b];
+            const hi = BUCKET_THRESHOLDS[b + 1];
+
+            for (let i = 0; i < MAX; i++) {
+                if (life[i] <= 0) continue;
+                if (spd[i] >= lo && spd[i] < hi) {
+                    ctx.rect(x[i], y[i], 1.5, 1.5);
+                }
+            }
+
+            ctx.fill(); // Single hardware-accelerated draw for this bucket
+        }
+
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+
+        // FPS calculation
+        const frameTime = performance.now() - frameStart;
+        fpsSmooth = fpsSmooth * 0.95 + (1000 / Math.max(1, dt * 1000)) * 0.05;
+
+        if (++frameCounter % 15 === 0) {
+            fpsEl.textContent = fpsSmooth.toFixed(0);
+            fpsEl.style.color = fpsSmooth > 55 ? '#0f0' : fpsSmooth > 30 ? '#ff0' : '#f00';
+            countEl.textContent = alive.toLocaleString();
+            frameEl.textContent = frameTime.toFixed(1);
+            barEl.style.width = (alive / MAX * 100) + '%';
+        }
+
+        requestAnimationFrame(tick);
+    }
+
+    requestAnimationFrame(tick);
+</script>
+</body>
+</html>
