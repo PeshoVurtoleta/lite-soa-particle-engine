@@ -1,6 +1,8 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { SoaParticleEngine, MAX_PARTICLES, LIFE_MIN, LIFE_MAX } from '../SoaParticleEngine.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { SoaParticleEngine, MAX_PARTICLES, LIFE_MIN, LIFE_MAX, LANE_MAX } from '../SoaParticleEngine.js';
 import { installFramePump } from './helpers/env.mjs';
 
 describe('SoaParticleEngine', () => {
@@ -454,6 +456,272 @@ describe('SoaParticleEngine', () => {
             assert.equal(e._head, 0);
             assert.equal(e.life[0], 0);
             e.destroy();
+        });
+    });
+
+    describe('position/velocity band (P-19)', () => {
+        // v1.0.4 guarded x/y/vx/vy with Number.isFinite, which passes for any
+        // finite f64 while the lanes are f32: emit(1e300, 0, 1e300, 0, 1) stored
+        // Infinity into x and vx and the caller's own physics turned it into NaN
+        // on the first frame. v1.0.5 rejects anything outside the SYMMETRIC f32
+        // band [-LANE_MAX, LANE_MAX]. Numbers are the bisection-measured pair from
+        // decisions/0002-the-door.md, not literals anyone typed.
+        const LANES = ['x', 'y', 'vx', 'vy', 'life', 'invLife', 'data'];
+        const OVER = 3.4028235677973366e+38; // one f32 step past LANE_MAX -> f32 Infinity
+
+        // Emit with `value` placed in exactly one of the four position/velocity
+        // slots; every other argument is legal. This exercises each lane
+        // INDEPENDENTLY, so a guard that checks x but forgets vy is caught.
+        const emitLaneValue = (laneIndex, value) => {
+            const e = new SoaParticleEngine(4);
+            const args = [0, 0, 0, 0, 1, 9];
+            args[laneIndex] = value; // 0=x 1=y 2=vx 3=vy
+            e.emit(args[0], args[1], args[2], args[3], args[4], args[5]);
+            return e;
+        };
+
+        const snapOf = (e) => ({
+            x: Array.from(e.x), y: Array.from(e.y), vx: Array.from(e.vx), vy: Array.from(e.vy),
+            life: Array.from(e.life), invLife: Array.from(e.invLife), data: Array.from(e.data),
+            head: e._head,
+        });
+
+        it('emit(1e300, 0, 1e300, 0, 1) is rejected; head unmoved; all seven lanes byte-identical (P-19 headline)', () => {
+            const e = new SoaParticleEngine(4);
+            const before = snapOf(e);
+            e.emit(1e300, 0, 1e300, 0, 1);
+            assert.equal(e._head, before.head, 'head must not advance on a rejected emit');
+            for (const l of LANES) assert.deepEqual(Array.from(e[l]), before[l], 'lane ' + l + ' must be byte-identical');
+            e.destroy();
+        });
+
+        // Reject NaN, both infinities, and the first value PAST the measured
+        // endpoint -- on each of the four lanes independently.
+        for (let laneIndex = 0; laneIndex < 4; laneIndex++) {
+            const laneName = LANES[laneIndex];
+            for (const value of [NaN, Infinity, -Infinity, OVER, -OVER, 1e300, -1e300]) {
+                it('rejects ' + value + ' in lane ' + laneName + ' (head unmoved, lanes byte-identical)', () => {
+                    const e = new SoaParticleEngine(4);
+                    const before = snapOf(e);
+                    // Re-emit the same lane value; every other arg legal.
+                    const args = [0, 0, 0, 0, 1, 9];
+                    args[laneIndex] = value;
+                    e.emit(args[0], args[1], args[2], args[3], args[4], args[5]);
+                    assert.equal(e._head, before.head, 'head must not advance');
+                    for (const l of LANES) assert.deepEqual(Array.from(e[l]), before[l], 'lane ' + l + ' changed');
+                    e.destroy();
+                });
+            }
+
+            // The measured endpoint +/-LANE_MAX is ACCEPTED on every lane.
+            for (const value of [LANE_MAX, -LANE_MAX]) {
+                it('accepts the measured endpoint ' + value + ' in lane ' + laneName, () => {
+                    const e = emitLaneValue(laneIndex, value);
+                    assert.equal(e._head, 1, 'endpoint value must be accepted (head advances)');
+                    assert.equal(e[laneName][0], Math.fround(value), 'endpoint stores as its f32 rounding, not Infinity');
+                    assert.ok(Number.isFinite(e[laneName][0]), 'stored value must be finite');
+                    e.destroy();
+                });
+            }
+
+            // The band has NO floor: 0, -0, ordinary negatives and a subnormal are
+            // all ACCEPTED. Copying the one-sided `life` test is the known-wrong
+            // implementation, and this pin catches it.
+            for (const value of [0, -0, -1, -12345.678, 1.4e-45 /* smallest positive f32 subnormal */, -1.4e-45]) {
+                it('accepts no-floor value ' + value + ' in lane ' + laneName, () => {
+                    const e = emitLaneValue(laneIndex, value);
+                    assert.equal(e._head, 1, value + ' must be accepted (the band has no floor)');
+                    assert.equal(e[laneName][0], Math.fround(value), 'value stores as its f32 rounding');
+                    e.destroy();
+                });
+            }
+        }
+
+        it('LANE_MAX is the measured f32 boundary (bisection), equal to LIFE_MAX but declared independently', () => {
+            assert.equal(LANE_MAX, 3.4028235677973362e+38, 'LANE_MAX is the measured largest finite-f32 f64');
+            assert.ok(Number.isFinite(Math.fround(LANE_MAX)), 'fround(LANE_MAX) is finite');
+            assert.ok(!Number.isFinite(Math.fround(OVER)), 'fround(one step past) is Infinity');
+            assert.ok(Number.isFinite(Math.fround(-LANE_MAX)), 'negative side is symmetric and finite');
+            assert.ok(!Number.isFinite(Math.fround(-OVER)), 'negative side one step past is Infinity');
+            // Equal number, independent contract: verified equal here on purpose,
+            // NOT aliased in source.
+            assert.equal(LANE_MAX, LIFE_MAX);
+        });
+
+        it('the rejection set is a strict SUPERSET of v1.0.4 (full old corpus, per lane INCLUDING life; not narrowed to numbers)', () => {
+            // Number.isFinite rejects far more than the non-finite numbers: null,
+            // numeric strings, "", booleans, arrays, undefined and plain objects
+            // too. The band uses relational operators, which COERCE (null -> 0,
+            // "5" -> 5, [7] -> 7, true -> 1), so each of those must be caught by the
+            // typeof half of the guard (P-23). The corpus is the FULL old-rejected
+            // set -- narrowing it to numbers is exactly how the first S2.1 draft's
+            // regression slipped every gate. Asserted per lane and life INCLUDED: a
+            // door that rejects x = "1" while accepting life = "1" is not a policy.
+            const oldRejected = [
+                NaN, Infinity, -Infinity,
+                null, '5', '', false, true, [], [7], undefined, {},
+            ];
+            // lanes 0=x 1=y 2=vx 3=vy 4=life (emitLaneValue's args[4] is life)
+            for (let laneIndex = 0; laneIndex <= 4; laneIndex++) {
+                for (const bad of oldRejected) {
+                    // Premise: v1.0.4's Number.isFinite chain rejected every one.
+                    assert.ok(!Number.isFinite(bad),
+                        'premise: ' + String(bad) + ' was isFinite-rejected in v1.0.4');
+                    const e = emitLaneValue(laneIndex, bad);
+                    assert.equal(e._head, 0,
+                        'superset: ' + String(bad) + ' in lane ' + LANES[laneIndex] + ' must still be rejected');
+                    e.destroy();
+                }
+            }
+            // STRICT for x/y/vx/vy: a finite value v1.0.4 ACCEPTED (isFinite true)
+            // that the band now rejects, so the new set is strictly larger there.
+            // life is excluded from this marker: v1.0.4 already rejected 1e300 as
+            // life via the P-17 band, so it is not a new reject on that lane.
+            assert.ok(Number.isFinite(1e300), 'premise: 1e300 is a finite f64, accepted by v1.0.4');
+            for (let laneIndex = 0; laneIndex < 4; laneIndex++) {
+                const strict = emitLaneValue(laneIndex, 1e300);
+                assert.equal(strict._head, 0,
+                    'strict: 1e300 in lane ' + LANES[laneIndex] + ' was accepted by v1.0.4 and must now be rejected');
+                strict.destroy();
+            }
+        });
+    });
+
+    describe('emit() never throws on hostile inputs (P-24)', () => {
+        // The load-bearing promise of the door: the constructor throws, emit()
+        // NEVER does (it is per particle per frame; a throw there is a render-loop
+        // crash). v1.0.4 broke it on dataFlag -- `(dataFlag | 0)` invokes ToNumeric,
+        // which THROWS for BigInt/Symbol and RUNS caller code (valueOf,
+        // Symbol.toPrimitive) for objects, propagating straight out of emit(). The
+        // fix leads every guard with `typeof`, so the coercing operator is reached
+        // only for primitive numbers. Pinned across ALL SIX arguments, not just
+        // dataFlag: the five lanes are throw-safe today only because P-23 forced
+        // them to lead with typeof, and nothing else pinned it -- which is exactly
+        // how the dataFlag hole survived.
+        const LANES = ['x', 'y', 'vx', 'vy', 'life', 'invLife', 'data'];
+        const ARGN = ['x', 'y', 'vx', 'vy', 'life', 'dataFlag'];
+
+        // Fresh hostile values per case (a revoked Proxy throws on every internal
+        // method; the throwing objects run caller code on coercion).
+        const hostiles = () => {
+            const revocable = Proxy.revocable({}, {});
+            revocable.revoke();
+            return [
+                ['BigInt', 10n],
+                ['Symbol', Symbol('s')],
+                ['throwing valueOf', { valueOf() { throw new Error('boom'); } }],
+                ['throwing Symbol.toPrimitive', { [Symbol.toPrimitive]() { throw new Error('boom'); } }],
+                ['revoked Proxy', revocable.proxy],
+            ];
+        };
+
+        for (let arg = 0; arg < 6; arg++) {
+            for (const [name] of hostiles()) {
+                it('does not throw and rejects a ' + name + ' in ' + ARGN[arg] + ' (head unmoved, lanes byte-identical)', () => {
+                    const e = new SoaParticleEngine(4);
+                    const before = LANES.map((l) => Array.from(e[l]));
+                    const head0 = e._head;
+                    // Rebuild the hostile value inside the test so each `it` owns it.
+                    const val = hostiles().find(([n]) => n === name)[1];
+                    const a = [0, 0, 0, 0, 1, 0];
+                    a[arg] = val;
+                    assert.doesNotThrow(() => e.emit(a[0], a[1], a[2], a[3], a[4], a[5]),
+                        'emit() must not throw on a hostile ' + ARGN[arg]);
+                    assert.equal(e._head, head0, 'head must not advance on a rejected emit');
+                    for (let i = 0; i < LANES.length; i++) {
+                        assert.deepEqual(Array.from(e[LANES[i]]), before[i],
+                            'lane ' + LANES[i] + ' must be byte-identical after a rejected hostile emit');
+                    }
+                    e.destroy();
+                });
+            }
+        }
+    });
+
+    describe('llms.txt rejection contract matches the guard chain (P-20)', () => {
+        // A documented rejection list that the code does not implement is the same
+        // fail-open class as an unvalidated input: the caller reasons from the
+        // wrong list. Assert the shipped llms.txt names each of the three
+        // implemented emit() rejection causes, so the doc and the guard chain
+        // cannot drift silently. This is a test, not a manual pass -- the same
+        // shape as the ASCII guard.
+        const llms = readFileSync(
+            fileURLToPath(new URL('../llms.txt', import.meta.url)), 'utf8');
+        const src = readFileSync(
+            fileURLToPath(new URL('../SoaParticleEngine.js', import.meta.url)), 'utf8');
+        const readme = readFileSync(
+            fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
+
+        it('does NOT still carry the stale v1.0.4 rejection wording', () => {
+            // The exact P-20 drift string: "silently rejects non-finite x/y/vx/vy
+            // or life <= 0". Both halves are wrong post-S2/S2.1.
+            assert.ok(llms.indexOf('life <= 0') === -1,
+                'llms.txt still documents "life <= 0", a rejection contract emit() does not implement');
+            assert.ok(llms.indexOf('non-finite x/y/vx/vy') === -1,
+                'llms.txt still documents "non-finite x/y/vx/vy", superseded by the [-LANE_MAX, LANE_MAX] band');
+        });
+
+        it('documents the x/y/vx/vy band rejection', () => {
+            assert.ok(/x\/y\/vx\/vy[^\n]*\[-LANE_MAX, LANE_MAX\]/.test(llms),
+                'llms.txt must document the x/y/vx/vy band [-LANE_MAX, LANE_MAX]');
+            // The band is actually implemented against LANE_MAX in the source.
+            assert.ok(src.indexOf('<= LANE_MAX)) return;') !== -1,
+                'source emit() must guard the lanes against LANE_MAX');
+        });
+
+        it('documents the life band rejection', () => {
+            assert.ok(/life[^\n]*\[LIFE_MIN, LIFE_MAX\]/.test(llms),
+                'llms.txt must document the life band [LIFE_MIN, LIFE_MAX]');
+            assert.ok(src.indexOf('life >= LIFE_MIN && life <= LIFE_MAX') !== -1,
+                'source emit() must guard life against the band');
+        });
+
+        it('documents the dataFlag int32 rejection, and the source guard leads with typeof (P-24)', () => {
+            assert.ok(/dataFlag[^\n]*int32/.test(llms),
+                'llms.txt must document the dataFlag int32 rejection (added in S2, previously undocumented)');
+            // The shipped guard is typeof-FIRST so a hostile BigInt/Symbol/object
+            // is rejected without throwing (P-24): `|` invokes ToNumeric, which
+            // throws or runs caller code, and is reached only once typeof narrows
+            // dataFlag to a number. Assert both halves, so dropping either fails.
+            assert.ok(src.indexOf("typeof dataFlag === 'number'") !== -1,
+                'source emit() dataFlag guard must lead with typeof (P-24), so `|` never runs on a non-number');
+            assert.ok(src.indexOf('(dataFlag | 0) === dataFlag') !== -1,
+                'source emit() must keep the exact-int32 test after the typeof gate');
+        });
+
+        it('LANE_MAX is documented in the Exports block beside LIFE_MIN/LIFE_MAX', () => {
+            assert.ok(/`LANE_MAX`/.test(llms), 'llms.txt Exports must list LANE_MAX');
+        });
+
+        it('documents the TYPE cause (typeof / not coerced), not only the range cause, for x/y/vx/vy AND life (P-23)', () => {
+            // The band uses relational operators, which COERCE: null -> 0 is INSIDE
+            // the band. A doc that gives the rejection reason as "outside the band"
+            // alone tells a reader emit(null, 0, 0, 0, 1) is accepted -- it is not.
+            // That is the P-20 fail-open class recurring. The doc must name the type
+            // rejection and that coercion does NOT happen; the source must implement
+            // it with typeof on the lanes AND on life. A drift guard that only checks
+            // the range half -- the half that was already right -- is decorative.
+            const src2 = src; // alias for readability in messages below
+
+            // Both shipped docs must state the coercion is rejected, not silently
+            // applied. "not coerced" is the exact sentence a reader needs.
+            assert.ok(/not coerced/i.test(llms),
+                'llms.txt must state a numeric string / boolean / array / null is REJECTED, not coerced');
+            assert.ok(/not coerced/i.test(readme),
+                'README.md Input Contract must state coerced non-numbers are rejected, not coerced');
+
+            // Both docs must name the typeof / not-a-number type cause explicitly.
+            assert.ok(/not a number/i.test(llms) || /typeof/.test(llms),
+                'llms.txt must name the type (not-a-number / typeof) rejection cause for x/y/vx/vy and life');
+            assert.ok(/not a number/i.test(readme) || /typeof/.test(readme),
+                'README.md must name the type (not-a-number / typeof) rejection cause');
+
+            // The source must actually implement the type half -- on a position lane
+            // AND on life, since life carried the identical coercion hole (P-23).
+            assert.ok(src2.indexOf("typeof vy === 'number'") !== -1,
+                "source emit() must type-check a position lane with typeof (e.g. typeof vy === 'number')");
+            assert.ok(src2.indexOf("typeof life === 'number'") !== -1,
+                "source emit() must type-check life with typeof (typeof life === 'number')");
         });
     });
 

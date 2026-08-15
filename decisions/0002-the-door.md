@@ -91,6 +91,40 @@ so it subsumes `Number.isInteger` and rejects strings, `null`, `NaN`, fractions,
 and out-of-int32-range values in a single test. `0` remains the default and is a
 legal recipe id.
 
+> **CORRECTED 2026-08-15 (P-24). The predicate above is not one comparison, and
+> it MAKES `emit()` THROW.** `|` invokes ToNumeric, which throws a `TypeError`
+> for `BigInt` and `Symbol`, and which runs caller code -- `valueOf`,
+> `Symbol.toPrimitive` -- for objects, so a hostile or merely buggy one
+> propagates straight out of `emit()`. Measured against published v1.0.4 and the
+> S2.1 tree:
+>
+> ```
+> emit(0,0,0,0,1,10n)          -> TypeError: Cannot mix BigInt and other types
+> emit(0,0,0,0,1,Symbol('s'))  -> TypeError: Cannot convert a Symbol value to a number
+> emit(0,0,0,0,1,{valueOf(){throw new Error('boom');}}) -> Error: boom
+> ```
+>
+> This breaks the single load-bearing promise of this whole record: **the
+> constructor throws, `emit()` never does**, because `emit()` is per particle per
+> frame and a throw there is a render-loop crash. The fix is the same
+> `typeof`-first, one-negation, two-half predicate that P-23 forced onto the five
+> lane guards -- and the fact that those five are throw-safe while this one is not
+> is precisely because they lead with `typeof` and it does not:
+>
+> ```js
+> if (!(typeof dataFlag === 'number' && (dataFlag | 0) === dataFlag)) return;
+> ```
+>
+> `typeof` never invokes user code and never throws, so the `|` is reached only
+> for values already known to be numbers. Verified: x/y/vx/vy/life reject
+> `BigInt`, `Symbol` and a throwing `valueOf` WITHOUT throwing on all five lanes.
+>
+> **The general rule this record should have stated from the start:** a guard in
+> `emit()` may not invoke any operation that can call user code or throw. That
+> rules out `|`, `+`, `<`, `>`, `==` and template interpolation on an unvalidated
+> argument. `typeof` and strict `===` are safe; everything else must come after a
+> `typeof` narrows the value to a primitive number.
+
 ### 3. `clear()` -- stays life-only, and the contract says so in writing
 
 `clear()` zeroes `life` and resets the write cursor. It does NOT touch
@@ -209,6 +243,14 @@ comparisons against NaN are false), both infinities, `0`, and every negative --
 so it **replaces** `!Number.isFinite(life) || life <= 0` rather than sitting
 beside it. Net branch count in `emit()` for P-05 + P-17: unchanged.
 
+> **CORRECTED 2026-08-15 (P-23). The paragraph above is wrong, and it shipped
+> wrong in v1.0.4.** Relational operators COERCE their operands; `Number.isFinite`
+> does not. The band replaces the old check for VALUE testing only -- it silently
+> dropped the TYPE test, and nothing noticed because every corpus in this suite is
+> made of numbers. Published v1.0.4 therefore accepts `life = "1"`, `life = true`
+> and `life = [1]`, storing `life[0] === 1` in all three. See the P-23 section
+> below for the corrected guard shape, which is what the code now implements.
+
 ### alpha tolerance
 
 Both `life` and `invLife` are f32 lanes, so `fround(life) * fround(1 / life)`
@@ -277,10 +319,141 @@ copy of itself), and a 90% band (+6.2% false positive on seed 12345).
 - S4 inherits a validated `max`, an `invLife` lane that cannot hold Infinity, and
   a written statement that dead slots have undefined non-`life` lanes.
 
+## Amendment -- 2026-08-15, v1.0.5 (S2.1): the band, one lane group over (P-19)
+
+This record shipped v1.0.4 claiming the door was closed. It was not. The `life`
+band closed one lane; `x`, `y`, `vx` and `vy` were left guarded by
+`Number.isFinite`, which passes for any finite f64 while the lanes are f32.
+
+Measured against published v1.0.4:
+
+```
+new SoaParticleEngine(4).emit(1e300, 0, 1e300, 0, 1)
+  -> ACCEPTED, head === 1, x[0] === Infinity, vx[0] === Infinity
+```
+
+This is P-05/P-17 with different lane names, and it was found during the S2
+review and deliberately held out of that session -- widening a shipped session's
+scope after review is how a door acquires an unreviewed hinge. It gets its own
+release rather than riding along with S3.
+
+### The band is SYMMETRIC and has no floor
+
+The `life` band is one-sided for two reasons that do not transfer: `life` must be
+positive, and `1 / life` overflows at the bottom. Position and velocity are
+legitimately signed, and nothing reciprocates them, so a subnormal or zero
+coordinate is a perfectly good coordinate. **Do not copy the one-sided `life`
+test.** That is the obvious wrong implementation and it has its own pin in T1.
+
+Measured by bisection on `Number.isFinite(Math.fround(m))`, 2026-08-15,
+node 26.3.1:
+
+```
+LANE_MAX = 3.4028235677973362e+38    largest f64 storing as a finite f32
+   above it: 3.4028235677973366e+38  -> f32 = Infinity
+   negative side: exactly symmetric  (verified, not assumed)
+```
+
+### One constant, named for the lane type, not for one lane
+
+`LANE_MAX` is numerically equal to `LIFE_MAX` and that is a coincidence of the
+storage type, not a shared contract -- so it is its own exported const. Reusing
+`LIFE_MAX` in the position test would weld two independent contracts together,
+and the next session to widen one would silently widen the other.
+
+It is ONE constant, not a `POS_MAX`/`VEL_MAX` pair. The constraint is identical
+for all four lanes because it comes from `Float32Array`, not from the physical
+quantity; two names for one identical bound is ceremony, and it would not
+survive S5 adding `extras` lanes that are neither position nor velocity.
+
+```js
+if (!(typeof x  === 'number' && x  >= -LANE_MAX && x  <= LANE_MAX)) return;
+if (!(typeof y  === 'number' && y  >= -LANE_MAX && y  <= LANE_MAX)) return;
+if (!(typeof vx === 'number' && vx >= -LANE_MAX && vx <= LANE_MAX)) return;
+if (!(typeof vy === 'number' && vy >= -LANE_MAX && vy <= LANE_MAX)) return;
+```
+
+Negation outside, exactly as the `life` band: the range half rejects `NaN` and
+both infinities on its own. The `typeof` half is **not optional** and the first
+draft of this session shipped without it -- see P-23 below.
+
+The rejection set must be a strict SUPERSET of v1.0.4's, asserted by looping the
+old corpus, not by reasoning about De Morgan. **The old corpus is not just the
+non-finite numbers.** `Number.isFinite` rejects `null`, `"5"`, `""`, `false`,
+`true`, `[]` and `[7]` too, and any "superset" test whose corpus omits them is
+testing the subset on which the claim happens to hold.
+
+### P-23 -- the band coerces, so `typeof` is load-bearing
+
+The first S2.1 draft wrote the four guards without `typeof`, on the strength of
+the (wrong) claim recorded above that the band "replaces" `isFinite`. Measured,
+published v1.0.4 vs that draft, same corpus through the `x` lane:
+
+```
+value    v1.0.4    draft
+null     rejected  ACCEPTED, x[0] = 0
+"5"      rejected  ACCEPTED, x[0] = 5
+""       rejected  ACCEPTED, x[0] = 0
+false    rejected  ACCEPTED, x[0] = 0
+true     rejected  ACCEPTED, x[0] = 1
+[]       rejected  ACCEPTED, x[0] = 0
+[7]      rejected  ACCEPTED, x[0] = 7
+```
+
+Relational operators coerce; `Number.isFinite` does not. A string laundered into
+a coordinate is the P-06 `dataFlag` class this record exists to close, so the
+draft was a regression against the version it was fixing.
+
+**`typeof`, not `Number.isFinite`.** Both are correct; `typeof` is a call-free V8
+type check while `Number.isFinite` is a builtin call, and it measured
+consistently cheaper (7-23% vs 40-48% over a no-type-check baseline on
+number-only input, median of 7, two runs). Both are far below `bench:emit`'s
+resolution limit R, so neither earns a CHANGELOG number.
+
+**The combiner is `&&` inside ONE negation.** `!Number.isFinite(x) || band` is
+not the same guard and is wrong: it accepts out-of-band finite numbers. Do not
+"simplify" the single negation into a disjunction of two tests.
+
+The same correction applies to the `life` band, which has carried this hole since
+v1.0.4:
+
+```js
+if (!(typeof life === 'number' && life >= LIFE_MIN && life <= LIFE_MAX)) return;
+```
+
+Fixed in the same release rather than deferred. Unlike P-19, this is not a
+different lane group needing its own policy call -- it is the identical predicate,
+and a door that rejects `x = "1"` while accepting `life = "1"` is not a policy,
+it is an accident.
+
+### Why `Infinity` in a position lane is not survivable
+
+Unlike a bad `life`, which expires, `Infinity` in `x` is permanent for the slot
+and the caller's own physics converts it to `NaN` on the first frame, using the
+idioms this package's own README teaches:
+
+```
+vx -= vx * k * dt   (drag)      -> NaN
+x  %= 800           (wrap)      -> NaN
+x  += vx * dt       (integrate) -> Infinity, forever
+```
+
+The slot renders nowhere and never recovers. There is no signal, no return value
+and no throw -- the exact fail-open shape this record exists to delete.
+
+### Hot path budget for this amendment
+
+`emit()` trades four `Number.isFinite` calls for eight comparisons, with the
+branch count unchanged at two. This is the one change in S2.1 that can plausibly
+cost something, so it is measured, not asserted: `npm run bench:emit`, delta
+reported only if it exceeds the R measured in that same run, `bench:emit:selftest`
+run first to prove the harness can stay silent.
+
 ## References
 
 - `SoaParticleEngine_ROADMAP.md` section 2, findings P-02..P-06, P-13, P-14,
-  P-17, P-18; section 5, S2 brief.
+  P-17, P-18, P-19, P-20; section 5, S2 and S2.1 briefs.
+- `S2_1_BRIEF.md` -- the amendment's session brief.
 - `test/bench-ceiling.mjs` -- the MAX_PARTICLES gate, C1..C7.
 - `test/bench-emit.mjs` -- the emit throughput harness and its self-test control.
 - `decisions/0001-positioning.md` -- why this package exists beside lite-particles.

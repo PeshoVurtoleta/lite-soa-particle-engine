@@ -9,7 +9,7 @@
  * finding ID -- the inversion of the S1 pins is the visible diff of this session.
  */
 
-import { SoaParticleEngine, MAX_PARTICLES, LIFE_MIN, LIFE_MAX } from '../../SoaParticleEngine.js';
+import { SoaParticleEngine, MAX_PARTICLES, LIFE_MIN, LIFE_MAX, LANE_MAX } from '../../SoaParticleEngine.js';
 import { check } from './harness.mjs';
 
 export function run() {
@@ -111,6 +111,93 @@ export function run() {
             check(e.invLife[0] === 1, () => 'T1.life(1): expected invLife 1, got ' + e.invLife[0]);
             check(Math.abs(e.life[0] * e.invLife[0] - 1) <= 2 ** -22,
                 () => 'T1.life(1): alpha out of tolerance, got ' + (e.life[0] * e.invLife[0]));
+            e.destroy();
+        }
+    }
+
+    // --- position/velocity band (P-19): x/y/vx/vy share the SYMMETRIC f32 band
+    // [-LANE_MAX, LANE_MAX]. Out-of-band values are rejected BEFORE any lane
+    // write, so head stays 0 and every lane stays 0. Each of the four lanes is
+    // exercised INDEPENDENTLY -- a guard that checks x but forgets vy must fail
+    // here. Unlike the one-sided `life` band this one has NO floor: 0, -0,
+    // ordinary negatives and subnormals are all accepted. LANE_MAX and the value
+    // one f32 step past it are the bisection-measured pair from
+    // decisions/0002-the-door.md, not literals anyone typed.
+    {
+        const OVER = 3.4028235677973366e+38; // one f32 step past LANE_MAX -> f32 Infinity
+        const SUB = 1.4e-45;                  // smallest positive f32 subnormal
+        const laneName = ['x', 'y', 'vx', 'vy'];
+
+        // Emit `value` in exactly one of the four position/velocity slots; every
+        // other argument legal (life 1, flag 0).
+        const emitLane = (li, value) => {
+            const e = new SoaParticleEngine(4);
+            const a = [0, 0, 0, 0, 1, 0];
+            a[li] = value;
+            e.emit(a[0], a[1], a[2], a[3], a[4], a[5]);
+            return e;
+        };
+
+        for (let li = 0; li < 4; li++) {
+            // Rejected: NaN, +/-Infinity, and the first value PAST each endpoint.
+            for (const value of [NaN, Infinity, -Infinity, OVER, -OVER]) {
+                const e = emitLane(li, value);
+                check(e._head === 0 && e.x[0] === 0 && e.y[0] === 0 && e.vx[0] === 0 && e.vy[0] === 0,
+                    () => 'T1.band(' + laneName[li] + '=' + value + '): P-19 contract -- out-of-band rejected, ' +
+                        'lanes untouched, got head ' + e._head + ' x ' + e.x[0] + ' y ' + e.y[0] +
+                        ' vx ' + e.vx[0] + ' vy ' + e.vy[0]);
+                e.destroy();
+            }
+
+            // Accepted: both measured endpoints store as a finite f32 (NOT Infinity).
+            for (const value of [LANE_MAX, -LANE_MAX]) {
+                const e = emitLane(li, value);
+                check(e._head === 1 && e[laneName[li]][0] === Math.fround(value) && Number.isFinite(e[laneName[li]][0]),
+                    () => 'T1.band(' + laneName[li] + '=' + value + '): P-19 contract -- measured endpoint must be ' +
+                        'accepted and finite, got head ' + e._head + ' stored ' + e[laneName[li]][0]);
+                e.destroy();
+            }
+
+            // Accepted with NO floor: 0, -0, an ordinary negative, and both signs
+            // of the smallest f32 subnormal. Copying the one-sided life test would
+            // reject these -- that is the known-wrong implementation, pinned here.
+            for (const value of [0, -0, -12345.678, SUB, -SUB]) {
+                const e = emitLane(li, value);
+                check(e._head === 1 && e[laneName[li]][0] === Math.fround(value),
+                    () => 'T1.band(' + laneName[li] + '=' + value + '): P-19 contract -- no-floor value must be ' +
+                        'accepted, got head ' + e._head + ' stored ' + e[laneName[li]][0]);
+                e.destroy();
+            }
+        }
+
+        // Non-number corpus (P-23): relational operators COERCE, so null -> 0,
+        // "5" -> 5, [7] -> 7, true -> 1 would be laundered into a lane without the
+        // typeof half of the guard. Every one is rejected by v1.0.4's isFinite and
+        // must STILL be rejected -- on all four position/velocity lanes AND on life
+        // (li 4), which carried the identical hole since v1.0.4. A guard that drops
+        // typeof on any one lane fails here.
+        const laneName5 = ['x', 'y', 'vx', 'vy', 'life'];
+        for (let li = 0; li <= 4; li++) {
+            for (const value of [null, '5', '', false, true, [], [7], undefined, {}]) {
+                const e = emitLane(li, value);
+                check(e._head === 0 && e.x[0] === 0 && e.y[0] === 0 && e.vx[0] === 0 &&
+                    e.vy[0] === 0 && e.life[0] === 0,
+                    () => 'T1.band(' + laneName5[li] + '=' + String(value) + '): P-23 contract -- coerced ' +
+                        'non-number must be rejected by the typeof guard, got head ' + e._head +
+                        ' x ' + e.x[0] + ' vx ' + e.vx[0] + ' life ' + e.life[0]);
+                e.destroy();
+            }
+        }
+
+        // The P-19 headline, measured against shipped v1.0.4: under the old
+        // Number.isFinite guard this ACCEPTED and stored Infinity into x and vx.
+        // The band rejects it: head unmoved, x and vx untouched.
+        {
+            const e = new SoaParticleEngine(4);
+            e.emit(1e300, 0, 1e300, 0, 1);
+            check(e._head === 0 && e.x[0] === 0 && e.vx[0] === 0,
+                () => 'T1.band headline: emit(1e300,0,1e300,0,1) must be rejected, got head ' +
+                    e._head + ' x ' + e.x[0] + ' vx ' + e.vx[0]);
             e.destroy();
         }
     }

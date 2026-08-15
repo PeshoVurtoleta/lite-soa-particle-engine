@@ -1,4 +1,4 @@
-# @zakkster/lite-soa-particle-engine v1.0.4
+# @zakkster/lite-soa-particle-engine v1.0.5
 
 > Zero-GC canvas particle system using Structure of Arrays. Ring buffer, flat TypedArrays, raw array access.
 
@@ -10,10 +10,13 @@ None (standalone)
 
 ## Exports
 - `SoaParticleEngine` -- Class
-- `VERSION` -- string ('1.0.4')
+- `VERSION` -- string ('1.0.5')
 - `MAX_PARTICLES` -- number (2**24 = 16777216), the maxParticles ceiling
 - `LIFE_MIN` -- number (2.938735964636876e-39), low end of the legal life band
 - `LIFE_MAX` -- number (3.4028235677973362e+38), high end of the legal life band
+- `LANE_MAX` -- number (3.4028235677973362e+38), symmetric f32 band bound for
+  x/y/vx/vy: an emit is rejected unless each lies in [-LANE_MAX, LANE_MAX]. Equal
+  to LIFE_MAX by coincidence of the f32 storage type, declared independently.
 
 ## Constructor
 `new SoaParticleEngine(maxParticles?, options?)`  -- Default: 1000. All memory allocated once.
@@ -33,7 +36,7 @@ caller's typo and a dead process. See decisions/0002-the-door.md.
 - `data` -- Int32Array (recipe ID or custom integer flag)
 
 ## API
-- `.emit(x, y, vx, vy, life, dataFlag?)` -- Emit one particle at the ring write cursor. NaN-safe (silently rejects non-finite x/y/vx/vy or life <= 0). When the pool is full it overwrites the slot at the cursor whether or not it is alive; see Ring Buffer Design.
+- `.emit(x, y, vx, vy, life, dataFlag?)` -- Emit one particle at the ring write cursor. Never throws; it silently rejects, before touching any lane, an emit whose (1) x/y/vx/vy is not a number (typeof) OR falls outside the symmetric f32 band [-LANE_MAX, LANE_MAX] -- a numeric string, boolean, array or null is REJECTED, not coerced (the band uses relational operators, so null would coerce to 0, which is inside the band; the typeof half is what stops it), and NaN and both infinities are rejected by the band half; (2) life is not a number OR falls outside [LIFE_MIN, LIFE_MAX] -- likewise "1", true and [1] are rejected, not coerced, and the band half also rejects NaN, both infinities, 0 and negatives; or (3) dataFlag is not a number (typeof) OR not an exact int32 ((dataFlag | 0) === dataFlag). The typeof half is not optional: `|` invokes ToNumeric, which throws for a BigInt or Symbol and runs caller code (valueOf, Symbol.toPrimitive) for objects, so a hostile or buggy dataFlag is rejected WITHOUT throwing only because typeof runs first. A rejected emit leaves the engine byte-identical and does not advance the write cursor. When the pool is full it overwrites the slot at the cursor whether or not it is alive; see Ring Buffer Design.
 - `.onTick(callback)` -- Register render callback: `(dt, x, y, vx, vy, life, invLife, data, max) => void`. Called every frame with raw TypedArrays -- mutate them directly.
 - `.start()` / `.stop()` / `.pause()` -- Control the RAF loop.
 - `.clear()` -- Kill all particles (zero all life values, reset the write cursor).

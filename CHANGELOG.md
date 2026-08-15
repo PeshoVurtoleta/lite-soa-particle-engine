@@ -3,6 +3,154 @@
 All notable changes to `@zakkster/lite-soa-particle-engine` are documented here.
 The format follows Keep a Changelog; this project uses semantic versioning.
 
+## [1.0.5] - 2026-08-15
+
+The last hinge. v1.0.4 closed the door on `life` and left the other four lanes
+open: `emit()` still guarded `x/y/vx/vy` with `Number.isFinite`, which passes for
+any finite f64 while those lanes are f32. A finite-but-huge coordinate or velocity
+stored as `Infinity`, and unlike a bad `life` -- which expires -- `Infinity` in a
+position lane is permanent and the caller's own physics turns it into `NaN` on the
+first frame. This is P-05/P-17 one lane group over. The policy is recorded in the
+S2.1 amendment to `decisions/0002-the-door.md`.
+
+### Fixed
+- **P-24 -- `emit()` THREW on a hostile `dataFlag`, and this shipped in v1.0.4.**
+  This is the largest contract break in the release: the single load-bearing
+  promise of the whole door is that **the constructor throws and `emit()` never
+  does** -- `emit()` is per particle per frame, and a throw there is a render-loop
+  crash. v1.0.4 broke it. The `dataFlag` guard `(dataFlag | 0) !== dataFlag` reads
+  like a pure integer test, but `|` invokes `ToNumeric`, which throws for `BigInt`
+  and `Symbol` and RUNS CALLER CODE (`valueOf`, `Symbol.toPrimitive`) for objects.
+  Measured against published v1.0.4 and the S2.1 tree:
+
+  ```
+  emit(0,0,0,0,1,10n)                                       -> TypeError: Cannot mix BigInt and other types
+  emit(0,0,0,0,1,Symbol('s'))                               -> TypeError: Cannot convert a Symbol value to a number
+  emit(0,0,0,0,1,{valueOf(){throw new Error('boom');}})     -> Error: boom
+  emit(0,0,0,0,1,{[Symbol.toPrimitive](){throw new Error('boom');}}) -> Error: boom
+  ```
+
+  The `dataFlag` guard was the ONLY one of the six that did not lead with `typeof`;
+  the five lane guards are throw-safe precisely because P-23 forced them to. The
+  fix is the same one-negation, two-half predicate:
+  `!(typeof dataFlag === 'number' && (dataFlag | 0) === dataFlag)`. `typeof` never
+  invokes user code and never throws, so `|` is reached only for primitive numbers
+  -- and as a stronger consequence, `emit()` now invokes NO caller code on ANY
+  argument, so there is no double-read / TOCTOU window on any of the six. The
+  general rule, now recorded in `decisions/0002-the-door.md`: a guard in `emit()`
+  may not invoke any operation that can call user code or throw (`|`, `+`, `<`,
+  `>`, `==`, template interpolation), so every guard must lead with `typeof`.
+  The "Never throws" claim in the README and `llms.txt` was FALSE when written; it
+  is true now.
+- **P-19 -- `x/y/vx/vy` overflowed f32 exactly as `life` did.**
+  `new SoaParticleEngine(4).emit(1e300, 0, 1e300, 0, 1)` was ACCEPTED under
+  v1.0.4: `head` advanced to 1, `x[0]` and `vx[0]` stored `Infinity`, and
+  `x[0] - vx[0]` was `NaN`, so `x[i] += vx[i] * dt` poisoned the lane on the next
+  frame. `emit()` now rejects any of the four lanes outside the SYMMETRIC f32 band
+  `[-LANE_MAX, LANE_MAX]` before touching a lane. Each guard is
+  `!(typeof v === 'number' && v >= -LANE_MAX && v <= LANE_MAX)`: the range half
+  rejects `NaN` and both infinities on its own, the `typeof` half rejects
+  non-numbers (see P-23), and both live inside ONE negation.
+- **P-23 -- the band's relational operators COERCE, so the guard needs `typeof`.**
+  Found in review of the first S2.1 draft, which wrote the band without a type
+  check on the strength of a (wrong) claim that the range test "replaces"
+  `Number.isFinite`. It does not: `Number.isFinite` never coerces, but `>=`/`<=`
+  do, so through the `x` lane, published v1.0.4 rejected all seven values below
+  while the draft ACCEPTED and stored every one --
+
+  ```
+  value    v1.0.4    draft
+  null     rejected  ACCEPTED, x[0] = 0
+  "5"      rejected  ACCEPTED, x[0] = 5
+  ""       rejected  ACCEPTED, x[0] = 0
+  false    rejected  ACCEPTED, x[0] = 0
+  true     rejected  ACCEPTED, x[0] = 1
+  []       rejected  ACCEPTED, x[0] = 0
+  [7]      rejected  ACCEPTED, x[0] = 7
+  ```
+
+  A string laundered into a coordinate is the P-06 `dataFlag` class this door
+  exists to close, so the draft was a regression against the version it fixed.
+  The `life` band carried the identical hole since v1.0.4 (`emit(0,0,0,0,"1")`
+  stored `life[0] === 1`; likewise `true` and `[1]`), so it is fixed in the same
+  release with the same predicate: a door that rejects `x = "1"` while accepting
+  `life = "1"` is not a policy. `typeof` -- not `Number.isFinite` -- because it is
+  a call-free V8 type check and measured cheaper (both are far below
+  `bench:emit`'s resolution R, so neither earns a number).
+- **P-20 -- `llms.txt` documented a rejection contract `emit()` does not
+  implement.** Line 36 read "NaN-safe (silently rejects non-finite x/y/vx/vy or
+  life <= 0)", wrong in three ways after S2/S2.1: `life = 1e-46` is greater than
+  zero and IS rejected (it is outside `[LIFE_MIN, LIFE_MAX]`); the `dataFlag`
+  int32 rejection was never mentioned; and the `x/y/vx/vy` rejection is now a band,
+  not a finiteness test. The line is rewritten against the shipped three-cause
+  guard chain, and a test asserts the documented list and the implemented one
+  cannot drift. README.md's Input Contract carried the same stale first bullet and
+  is rewritten to match.
+
+### Added
+- `LANE_MAX` export (`3.4028235677973362e+38`), the symmetric f32 band bound for
+  `x/y/vx/vy`: an emit is rejected unless each lies in `[-LANE_MAX, LANE_MAX]`.
+  **Measured** by bisection on `Number.isFinite(Math.fround(m))` -- the largest
+  f64 that stores as a finite f32; the next value up,
+  `3.4028235677973366e+38`, stores as `Infinity`, and the negative side is exactly
+  symmetric. It is numerically EQUAL to `LIFE_MAX` by coincidence of the f32
+  storage type, and is declared INDEPENDENTLY, not aliased: the bound comes from
+  `Float32Array`, not from a physical quantity, so it is identical for all four
+  lanes and welding it to `LIFE_MAX` would let a future session widen one and
+  silently widen the other. Unlike the one-sided `life` band, this band has NO
+  floor -- `0`, `-0`, negatives and subnormals are all legal coordinates.
+
+### Changed
+- **Breaking for callers passing out-of-band coordinates.** v1.0.4 accepted a
+  finite-but-huge `x/y/vx/vy` and stored `Infinity`; v1.0.5 rejects it. Every such
+  caller was already storing `Infinity` into a lane and turning it to `NaN` on the
+  next frame, so the affected callers are already broken and do not know it.
+- **Breaking for callers passing coerced non-numbers (P-23).** v1.0.4 accepted a
+  string, boolean or array in `x/y/vx/vy` or `life` and coerced it (`"5"` -> `5`,
+  `true` -> `1`, `[7]` -> `7`); v1.0.5 rejects it. Those callers were laundering an
+  untyped value into a lane, the exact class the door exists to close.
+  Both are shipped as a patch for that reason, and called out here regardless.
+
+### Performance
+`emit()` trades the removed `Number.isFinite` calls for a `typeof` type check plus
+two range comparisons per lane -- the one place this session can plausibly cost
+something, so it is measured, not assumed. `npm run bench:emit` (Apple M4 Pro,
+node v26.3.1, 51 interleaved pairs against the frozen v1.0.3 baseline): the delta
+was **-5.5% against that run's own in-run resolution limit of R = 7.0%** (its
+phase-1 control was clean, bias 2.1% within R). That is below resolution, so this
+release makes **no throughput claim in either direction** -- a number smaller than
+the noise that produced it is not a result. The separate `npm run
+bench:emit:selftest` control is bimodal on this machine and resolves a spurious
+difference between two byte-identical implementations in a minority of runs; that
+is not selected away here, because it does not need to be -- a FAILING selftest
+means R is UNDERSTATED, and a delta below a too-small R is below any larger one,
+so "below resolution, no claim" is robust either way. `typeof` was chosen over
+`Number.isFinite` because it is a call-free V8 type check rather than a builtin
+call, but the difference sits far below R and earns no number here.
+
+### Testing
+98 -> 256 `node:test` cases. P-19 has a named position/velocity band group that
+fails against v1.0.4 (the `emit(1e300, 0, 1e300, 0, 1)` headline, the two measured
+endpoints accepted, the first value past each rejected, plus the no-floor cases,
+each of the four lanes exercised independently). P-23 restores the strict-superset
+test to the FULL old-rejected corpus -- `null`, `"5"`, `""`, `false`, `true`,
+`[]`, `[7]`, `undefined`, `{}` alongside the non-finite numbers -- asserted per
+lane, life INCLUDED, so a guard that drops `typeof` on any one lane fails it.
+P-24 has a hostile-input group (`BigInt`, `Symbol`, throwing `valueOf`, throwing
+`Symbol.toPrimitive`, revoked and throwing-trap `Proxy`) asserting `emit()` does
+NOT throw and rejects the emit -- head unmoved, all seven lanes byte-identical --
+across ALL SIX arguments, and a `qa-s2_1` matrix whose three former "BLOCKER"
+throw-pins were inverted to the shipped contract once the fix landed. P-20 has an
+`llms.txt`/README/source drift test that now also asserts the type cause.
+Torture T1 gained the band matrix and the P-23 non-number matrix, T0 extended its
+total-rejection corpus to the P-19 and P-23 rejects, and T9 gained in-process
+controls plus three whole-tier reverts: `SOA_TORTURE_REVERT_BAND=1` swaps the band
+back to `Number.isFinite` (observed to fail the T1 band pin),
+`SOA_TORTURE_DROP_TYPEOF=1` drops the `typeof` half (observed to fail the T1 P-23
+corpus pin), and `SOA_TORTURE_DROP_DATAFLAG_TYPEOF=1` reverts the `dataFlag` guard
+to the v1.0.4 typeof-less form and is observed to make `emit()` throw on a `BigInt`
+(P-24). Each reverted run exits non-zero.
+
 ## [1.0.4] - 2026-08-15
 
 The door. Seven silent-corruption findings were one bug in seven costumes:

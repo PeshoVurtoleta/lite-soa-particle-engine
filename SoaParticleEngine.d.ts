@@ -34,9 +34,11 @@ export class SoaParticleEngine {
      */
     constructor(maxParticles?: number, options?: SoaParticleEngineOptions);
     /**
-     * Emit a particle. Never throws. `life` outside [LIFE_MIN, LIFE_MAX] (NaN,
-     * infinities, 0, negatives, sub-floor lifetimes) is silently rejected, as is a
-     * `dataFlag` that is not an exact int32. A rejected emit is a no-op.
+     * Emit a particle. Never throws. Any of `x/y/vx/vy` outside the symmetric f32
+     * band [-LANE_MAX, LANE_MAX] (NaN, both infinities) is silently rejected;
+     * `life` outside [LIFE_MIN, LIFE_MAX] (NaN, infinities, 0, negatives, sub-floor
+     * lifetimes) is silently rejected, as is a `dataFlag` that is not an exact
+     * int32. A rejected emit is a no-op.
      */
     emit(x: number, y: number, vx: number, vy: number, life: number, dataFlag?: number): void;
     onTick(callback: TickCallback): void;
@@ -57,5 +59,12 @@ export const LIFE_MIN: number;
 
 /** Largest life storable as a finite f32: 3.4028235677973362e+38. */
 export const LIFE_MAX: number;
+
+/**
+ * Symmetric f32 band bound for x/y/vx/vy: 3.4028235677973362e+38, the largest
+ * f64 that stores as a finite f32. Equal to LIFE_MAX by coincidence of the
+ * storage type, declared independently.
+ */
+export const LANE_MAX: number;
 
 export default SoaParticleEngine;

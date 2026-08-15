@@ -15,7 +15,7 @@
  * for maximum rendering flexibility.
  */
 
-export const VERSION = '1.0.4';
+export const VERSION = '1.0.5';
 
 /**
  * Upper bound on maxParticles, a policy number (not a probe of what happens to
@@ -50,6 +50,23 @@ export const LIFE_MIN = 2.938735964636876e-39;
 export const LIFE_MAX = 3.4028235677973362e+38;
 
 /**
+ * The symmetric f32 lane band for x/y/vx/vy: an emit is rejected unless each of
+ * those four values lies in [-LANE_MAX, LANE_MAX]. LANE_MAX is the largest f64
+ * that Math.fround maps to a finite f32; the next value up,
+ * 3.4028235677973366e+38, stores as f32 Infinity. MEASURED by bisection on
+ * Number.isFinite(Math.fround(m)); the negative side is exactly symmetric.
+ *
+ * The bound comes from Float32Array, not from any physical quantity, so it is
+ * identical for all four lanes -- one LANE_MAX, not a POS_MAX/VEL_MAX pair. It is
+ * numerically EQUAL to LIFE_MAX by coincidence of the storage type, not by shared
+ * contract, and is declared independently so widening one never silently widens
+ * the other. Unlike the `life` band this one is symmetric and has NO floor: 0,
+ * -0, negatives and subnormals are all legal coordinates. See the S2.1 amendment
+ * in decisions/0002-the-door.md.
+ */
+export const LANE_MAX = 3.4028235677973362e+38;
+
+/**
  * COLD-path helper: render a rejected constructor argument into an error message
  * without EVER throwing itself, so this library's named error can never be
  * replaced by a foreign one on the way to a throw -- a door with a gap. Strings
@@ -79,10 +96,11 @@ function _showArg(v) {
  *     before allocating, so the bare "Invalid typed array length" never escapes.
  *   - emit() NEVER throws (it is per-frame, per-particle; a throw is a render-loop
  *     crash). It silently rejects, before touching any lane, any emit whose
- *     x/y/vx/vy are non-finite, whose `life` is outside [LIFE_MIN, LIFE_MAX]
- *     (which also rejects NaN, both infinities, 0 and negatives), or whose
- *     dataFlag is not an exact int32. A rejected emit leaves the engine
- *     byte-identical and does not advance _head.
+ *     x/y/vx/vy fall outside the symmetric f32 band [-LANE_MAX, LANE_MAX]
+ *     (which also rejects NaN and both infinities), whose `life` is outside
+ *     [LIFE_MIN, LIFE_MAX] (which also rejects NaN, both infinities, 0 and
+ *     negatives), or whose dataFlag is not an exact int32. A rejected emit
+ *     leaves the engine byte-identical and does not advance _head.
  *   - A frame gap larger than maxDt is CLAMPED to maxDt: a clamped frame LOSES
  *     time by design (the alternative is particles tunnelling). This engine is
  *     therefore NOT a fixed-step simulator. A caller needing a fixed-step
@@ -168,27 +186,52 @@ export class SoaParticleEngine {
      * write, so a rejected emit leaves the engine byte-identical and does not
      * advance _head.
      *
-     * @param {number} x        X position
-     * @param {number} y        Y position
-     * @param {number} vx       X velocity
-     * @param {number} vy       Y velocity
+     * @param {number} x        X position. Must lie in the symmetric f32 band
+     *   [-LANE_MAX, LANE_MAX]; out-of-band (including NaN and both infinities) is
+     *   silently rejected. 0, -0, negatives and subnormals are all accepted.
+     * @param {number} y        Y position. Same band as x.
+     * @param {number} vx       X velocity. Same band as x.
+     * @param {number} vy       Y velocity. Same band as x.
      * @param {number} life     Lifetime in seconds. Must lie in the legal band
      *   [LIFE_MIN, LIFE_MAX]; out-of-band life (including NaN, both infinities, 0
      *   and negatives, and lifetimes so small their invLife would overflow to
      *   Infinity) is silently rejected.
-     * @param {number} [dataFlag=0] Recipe ID or custom flag. Must be an exact
-     *   int32 ((dataFlag | 0) === dataFlag); a fractional, out-of-range,
-     *   non-numeric, or NaN flag is rejected. 0 is the default and a legal id.
+     * @param {number} [dataFlag=0] Recipe ID or custom flag. Must be a number that
+     *   is an exact int32 (typeof number and (dataFlag | 0) === dataFlag); a
+     *   fractional, out-of-range, non-numeric, or NaN flag is rejected. A hostile
+     *   BigInt, Symbol, or object with a throwing valueOf / Symbol.toPrimitive is
+     *   also rejected WITHOUT throwing, because the guard leads with typeof (P-24).
+     *   0 is the default and a legal id.
      */
     emit(x, y, vx, vy, life, dataFlag = 0) {
         if (this._destroyed) return;
 
-        // Prevent NaN poisoning in TypedArrays. The life band test also rejects
-        // NaN, both infinities, 0 and negatives -- two checks folded into one.
-        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-        if (!Number.isFinite(vx) || !Number.isFinite(vy)) return;
-        if (!(life >= LIFE_MIN && life <= LIFE_MAX)) return;
-        if ((dataFlag | 0) !== dataFlag) return;
+        // x/y/vx/vy share the symmetric f32 lane band [-LANE_MAX, LANE_MAX]. Each
+        // guard has TWO non-optional halves inside ONE negation: the range half
+        // (>= -LANE_MAX && <= LANE_MAX) rejects NaN and both infinities on its own
+        // (every comparison against them is false), and the typeof half rejects
+        // non-numbers. Both are required -- relational operators COERCE (null -> 0,
+        // "5" -> 5, [7] -> 7, true -> 1), so without typeof a string or boolean is
+        // laundered into a coordinate, the P-06/P-23 class this door exists to
+        // close. typeof is a call-free V8 type check, cheaper than Number.isFinite
+        // and not a builtin call. The band has NO floor: 0, -0, negatives and
+        // subnormals are all legal coordinates.
+        if (!(typeof x  === 'number' && x  >= -LANE_MAX && x  <= LANE_MAX)) return;
+        if (!(typeof y  === 'number' && y  >= -LANE_MAX && y  <= LANE_MAX)) return;
+        if (!(typeof vx === 'number' && vx >= -LANE_MAX && vx <= LANE_MAX)) return;
+        if (!(typeof vy === 'number' && vy >= -LANE_MAX && vy <= LANE_MAX)) return;
+        // The life band, same two-half predicate: the range half also rejects NaN,
+        // both infinities, 0 and negatives; the typeof half rejects coerced
+        // non-numbers ("1", true, [1]) that v1.0.4 laundered into life (P-23).
+        if (!(typeof life === 'number' && life >= LIFE_MIN && life <= LIFE_MAX)) return;
+        // dataFlag, same typeof-first predicate (P-24). `|` invokes ToNumeric,
+        // which THROWS for BigInt/Symbol and RUNS caller code (valueOf,
+        // Symbol.toPrimitive) for objects -- so `(dataFlag | 0)` on an unvalidated
+        // argument makes emit() throw, breaking its never-throws contract. typeof
+        // never calls user code and never throws, so `|` is reached only once
+        // dataFlag is known to be a primitive number. (d | 0) === d is then the
+        // exact-int32 test: it rejects fractions and out-of-int32-range values.
+        if (!(typeof dataFlag === 'number' && (dataFlag | 0) === dataFlag)) return;
 
         const i = this._head;
 

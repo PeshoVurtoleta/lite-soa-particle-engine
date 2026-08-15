@@ -53,14 +53,28 @@ export function run() {
         const head0 = engine._head;
         snapshot();
 
-        // ~1 in 4 attempts is a deliberate rejection.
+        // ~1 in 4 attempts is a deliberate rejection. The corpus covers every
+        // rejection cause: non-finite x/y/vx/vy, the P-19 out-of-band f32 lane
+        // values (finite f64 that overflows the f32 lane, exercised independently
+        // per lane), the P-23 coerced non-numbers (which relational operators
+        // would launder into a lane without the typeof guard) on position AND life
+        // lanes, life <= 0, and life < 0. Each must leave the engine bit-for-bit
+        // unchanged.
         if ((r & 3) === 0) {
-            const kind = (r >>> 2) % 5;
+            const kind = (r >>> 2) % 13;
             if (kind === 0) engine.emit(NaN, 0, 0, 0, 1);
             else if (kind === 1) engine.emit(0, Infinity, 0, 0, 1);
             else if (kind === 2) engine.emit(0, 0, NaN, 0, 1);
             else if (kind === 3) engine.emit(0, 0, 0, 0, 0);   // life <= 0
-            else engine.emit(0, 0, 0, 0, -1);                  // life < 0
+            else if (kind === 4) engine.emit(0, 0, 0, 0, -1);  // life < 0
+            else if (kind === 5) engine.emit(1e300, 0, 0, 0, 1);                 // P-19: x out of f32 band
+            else if (kind === 6) engine.emit(0, 0, 0, 1e300, 1);                 // P-19: vy out of f32 band (independent lane)
+            else if (kind === 7) engine.emit(0, 0, 3.4028235677973366e+38, 0, 1); // P-19: vx one f32 step past LANE_MAX
+            else if (kind === 8) engine.emit(null, 0, 0, 0, 1);                  // P-23: null coerces to 0 -- typeof rejects
+            else if (kind === 9) engine.emit(0, '5', 0, 0, 1);                   // P-23: numeric string in y
+            else if (kind === 10) engine.emit(0, 0, 0, [7], 1);                  // P-23: array in vy
+            else if (kind === 11) engine.emit(0, 0, 0, 0, '1');                  // P-23: string laundered into life=1 by v1.0.4
+            else engine.emit(0, 0, 0, 0, true);                                  // P-23: boolean life
 
             // Rejection is total: head unchanged AND every lane byte-identical.
             check(engine._head === head0,

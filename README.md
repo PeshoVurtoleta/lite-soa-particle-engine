@@ -117,18 +117,40 @@ render loop is a crash.
 **`emit()` silently rejects**, before touching any lane, and returns without
 advancing the write cursor:
 
-- non-finite `x`, `y`, `vx` or `vy`;
-- `life` outside `[LIFE_MIN, LIFE_MAX]` -- which also covers `NaN`, both
-  infinities, `0` and negatives;
-- a `dataFlag` that is not an exact int32.
+- `x`, `y`, `vx` or `vy` that is **not a number** (`typeof`), or is outside the
+  symmetric f32 band `[-LANE_MAX, LANE_MAX]`. The band half covers `NaN` and both
+  infinities; the type half is why **a numeric string, boolean, array or `null` is
+  rejected, not coerced** -- the band uses `>=`/`<=`, which would coerce `null` to
+  `0` (inside the band) or `"5"` to `5`, so without the `typeof` check an untyped
+  value would be laundered into a coordinate;
+- `life` that is **not a number**, or is outside `[LIFE_MIN, LIFE_MAX]`. Same two
+  halves: `"1"`, `true` and `[1]` are rejected, not coerced, and the band half also
+  covers `NaN`, both infinities, `0` and negatives;
+- a `dataFlag` that is **not a number** (`typeof`) or is not an exact int32. The
+  type half is not optional: `(dataFlag | 0)` invokes `ToNumeric`, which **throws**
+  for a `BigInt` or `Symbol` and **runs caller code** (`valueOf`,
+  `Symbol.toPrimitive`) for an object, so a hostile or buggy `dataFlag` is rejected
+  **without throwing** only because `typeof` runs first and short-circuits before
+  the `|`. `emit()` invokes no caller code on any argument.
 
 A rejected `emit()` leaves the engine byte-identical.
 
-`LIFE_MIN` (`2.938735964636876e-39`) and `LIFE_MAX` (`3.4028235677973362e+38`)
-are exported, and both are **measured** f32 boundaries. Below `LIFE_MIN`,
-`1/life` overflows f32 and `invLife` becomes `Infinity`, making the documented
+`LIFE_MIN` (`2.938735964636876e-39`), `LIFE_MAX` (`3.4028235677973362e+38`) and
+`LANE_MAX` (`3.4028235677973362e+38`) are exported, and all three are
+**measured** f32 boundaries, not analytic ones. Below `LIFE_MIN`, `1/life`
+overflows f32 and `invLife` becomes `Infinity`, making the documented
 `life[i] * invLife[i]` alpha `NaN`; above `LIFE_MAX`, `life` itself stores as
 `Infinity`. Both ends silently corrupted a particle in earlier versions.
+
+`LANE_MAX` is the largest f64 that stores as a finite f32 -- one step past it,
+a position or velocity would round to `Infinity`, which is permanent in a lane
+and turns the caller's own physics to `NaN` on the first frame. It is
+numerically equal to `LIFE_MAX` by coincidence of the shared f32 storage type,
+but is a separate export: the bound comes from `Float32Array`, not from any
+physical quantity, so one `LANE_MAX` covers all four lanes. Unlike the `life`
+band this one is **symmetric and has no floor** -- `x`, `y`, `vx` and `vy` are
+legitimately signed and nothing reciprocates them, so `0`, `-0`, ordinary
+negatives and subnormals are all perfectly good coordinates and are accepted.
 
 Because both lanes are f32, alpha at birth is `1` only to within one f32 ulp:
 the measured worst case across the legal band is `|alpha - 1| = 2.31e-7`. Clamp
