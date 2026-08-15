@@ -25,6 +25,9 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "torture": "node --expose-gc test/torture.mjs",
+    "bench:ceiling": "node test/bench-ceiling.mjs",
+    "bench:emit": "node --expose-gc test/bench-emit.mjs",
+    "bench:emit:selftest": "node --expose-gc test/bench-emit.mjs --selftest",
     "verify": "npm test && npm run torture"
   },
   "engines": {
