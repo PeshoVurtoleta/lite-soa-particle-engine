@@ -1,6 +1,6 @@
-# @zakkster/lite-soa-particle-engine v1.0.5
+# @zakkster/lite-soa-particle-engine v1.1.0
 
-> Zero-GC canvas particle system using Structure of Arrays. Ring buffer, flat TypedArrays, raw array access.
+> Zero-GC canvas particle system using Structure of Arrays. Ring buffer, flat TypedArrays, raw array access. Host-drivable via tick(dt).
 
 ## Installation
 npm install @zakkster/lite-soa-particle-engine
@@ -10,7 +10,7 @@ None (standalone)
 
 ## Exports
 - `SoaParticleEngine` -- Class
-- `VERSION` -- string ('1.0.5')
+- `VERSION` -- string ('1.1.0')
 - `MAX_PARTICLES` -- number (2**24 = 16777216), the maxParticles ceiling
 - `LIFE_MIN` -- number (2.938735964636876e-39), low end of the legal life band
 - `LIFE_MAX` -- number (3.4028235677973362e+38), high end of the legal life band
@@ -24,7 +24,10 @@ THROWS a named error rather than constructing an unusable engine:
 - `maxParticles` not a number -> TypeError `SoaParticleEngine: maxParticles must be a number, got ...`
 - `maxParticles` not an integer in [1, MAX_PARTICLES] -> RangeError naming the value.
   Rejects 0, 2.5, NaN, -1, Infinity, '10', null and anything above the ceiling.
-- `options.maxDt` (default 0.1) must be a finite number > 0 or the constructor throws.
+- `options.maxDt` (default 0.1) must be a number > 0 or the constructor throws.
+  `Infinity` is admitted (and only Infinity beyond the finite range): it disables
+  the high-side clamp for a fixed-step caller driving `tick(dt)` directly. `NaN`,
+  `0` and negatives still throw a RangeError.
 The lane allocator has no polite-failure size -- a large enough request kills the
 process instead of throwing -- so this validation is the only guard between a
 caller's typo and a dead process. See decisions/0002-the-door.md.
@@ -36,9 +39,27 @@ caller's typo and a dead process. See decisions/0002-the-door.md.
 - `data` -- Int32Array (recipe ID or custom integer flag)
 
 ## API
-- `.emit(x, y, vx, vy, life, dataFlag?)` -- Emit one particle at the ring write cursor. Never throws; it silently rejects, before touching any lane, an emit whose (1) x/y/vx/vy is not a number (typeof) OR falls outside the symmetric f32 band [-LANE_MAX, LANE_MAX] -- a numeric string, boolean, array or null is REJECTED, not coerced (the band uses relational operators, so null would coerce to 0, which is inside the band; the typeof half is what stops it), and NaN and both infinities are rejected by the band half; (2) life is not a number OR falls outside [LIFE_MIN, LIFE_MAX] -- likewise "1", true and [1] are rejected, not coerced, and the band half also rejects NaN, both infinities, 0 and negatives; or (3) dataFlag is not a number (typeof) OR not an exact int32 ((dataFlag | 0) === dataFlag). The typeof half is not optional: `|` invokes ToNumeric, which throws for a BigInt or Symbol and runs caller code (valueOf, Symbol.toPrimitive) for objects, so a hostile or buggy dataFlag is rejected WITHOUT throwing only because typeof runs first. A rejected emit leaves the engine byte-identical and does not advance the write cursor. When the pool is full it overwrites the slot at the cursor whether or not it is alive; see Ring Buffer Design.
-- `.onTick(callback)` -- Register render callback: `(dt, x, y, vx, vy, life, invLife, data, max) => void`. Called every frame with raw TypedArrays -- mutate them directly.
-- `.start()` / `.stop()` / `.pause()` -- Control the RAF loop.
+- `.tick(dt)` -- PRIMARY stepping API. Advance the simulation by `dt` seconds and
+  invoke the registered onTick callback once. Drive it from a host game loop, a
+  fixed-step accumulator, lite-scheduler, or a worker -- no DOM required. Never
+  throws (per-frame, like emit): a `dt` that is not a number OR is < 0 is silently
+  rejected. The typeof half is not optional and leads the guard: a bare relational
+  operator on `dt` would coerce ('0.05' -> 0.05, null -> 0, [7] -> 7, true -> 1)
+  and would THROW for a BigInt or Symbol and run caller code (valueOf,
+  Symbol.toPrimitive), so `NaN`, `-1`, `'0.05'`, `true`, `[0.05]`, `null`,
+  `undefined`, a BigInt, a Symbol and an object with a throwing valueOf are all
+  rejected WITHOUT throwing only because typeof runs first. `dt` is CLAMPED to
+  maxDt on the high side and REJECTED (not clamped) on the low side. `dt` of 0,
+  -0 and exactly maxDt are accepted. Returns `true` iff the callback ran; `false`
+  on a rejected dt, no registered callback, or a destroyed engine.
+- `.emit(x, y, vx, vy, life, dataFlag?)` -- Emit one particle at the ring write cursor. Never throws; it silently rejects, before touching any lane, an emit whose (1) x/y/vx/vy is not a number (typeof) OR falls outside the symmetric f32 band [-LANE_MAX, LANE_MAX] -- a numeric string, boolean, array or null is REJECTED, not coerced (the band uses relational operators, so null would coerce to 0, which is inside the band; the typeof half is what stops it), and NaN and both infinities are rejected by the band half; (2) life is not a number OR falls outside [LIFE_MIN, LIFE_MAX] -- likewise "1", true and [1] are rejected, not coerced, and the band half also rejects NaN, both infinities, 0 and negatives; or (3) dataFlag is not a number (typeof) OR not an exact int32 ((dataFlag | 0) === dataFlag). The typeof half is not optional: `|` invokes ToNumeric, which throws for a BigInt or Symbol and runs caller code (valueOf, Symbol.toPrimitive) for objects, so a hostile or buggy dataFlag is rejected WITHOUT throwing only because typeof runs first. A rejected emit leaves the engine byte-identical and does not advance the write cursor. Returns the slot index written (in [0, max)) on success, or -1 on every rejection path. The index is a RECEIPT, not an identity: it is valid only until that slot is reused (a full ring overwrites the slot at the cursor whether or not it is alive; see Ring Buffer Design), so do not store it as a durable handle.
+- `.onTick(callback)` -- Register render callback: `(dt, x, y, vx, vy, life, invLife, data, max) => void`. Called every frame (or every tick(dt)) with raw TypedArrays -- mutate them directly. COLD path, so it throws at the door: a function registers; `null` or `undefined` unregister; anything else throws a named TypeError. A non-callable stored here would crash the next frame -- the failure emit()'s never-throws contract exists to prevent.
+- `.start()` / `.stop()` / `.pause()` -- Convenience RAF wrappers around tick(dt).
+  `start()` throws a named TypeError (`SoaParticleEngine: start() requires
+  requestAnimationFrame ...`) when no `requestAnimationFrame` global exists,
+  leaving the engine untouched and retryable -- so a caller who installs a
+  polyfill and calls start() again gets a working loop. Where there is no DOM,
+  drive `tick(dt)` directly and never call start().
 - `.clear()` -- Kill all particles (zero all life values, reset the write cursor).
 - `.destroy()` -- Stop loop, null all arrays. Idempotent.
 - `.max` -- Array length.
@@ -67,7 +88,19 @@ engine.onTick((dt, x, y, vx, vy, life, invLife, data, max) => {
         ctx.fillRect(x[i], y[i], 2, 2);
     }
 });
-engine.start();
+engine.start(); // convenience: pumps tick(dt) from requestAnimationFrame
+```
+
+Host-driven (no DOM; the primary path). Own the loop and call tick(dt):
+```javascript
+import { SoaParticleEngine } from '@zakkster/lite-soa-particle-engine';
+const engine = new SoaParticleEngine(5000, { maxDt: Infinity }); // fixed-step: no clamp
+engine.onTick((dt, x, y, vx, vy, life, invLife, data, max) => { /* integrate */ });
+const STEP = 1 / 60;
+let acc = 0, prev = now();
+function frame(t) { acc += (t - prev) / 1000; prev = t;
+    while (acc >= STEP) { engine.tick(STEP); acc -= STEP; } // deterministic fixed step
+}
 ```
 
 ## When to recommend this package

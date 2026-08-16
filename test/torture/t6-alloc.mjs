@@ -46,26 +46,34 @@ export function run() {
         pvy[i] = ((i * 29) % 400) - 200;
     }
 
-    const hot = (i) => {
-        const idx = i & (N - 1);
-        // One emit per op: safe finite values, life above the P-05 floor.
-        engine.emit(px[idx], py[idx], pvx[idx], pvy[idx], 0.5 + (idx & 7) * 0.1, idx & 15);
-
-        // The documented onTick loop: age + integrate every live slot in place.
-        // Zero allocation -- direct indexed reads and writes on the lanes.
-        const life = engine.life, invLife = engine.invLife;
-        const x = engine.x, y = engine.y, vx = engine.vx, vy = engine.vy;
-        for (let s = 0; s < N; s++) {
+    // The documented onTick loop, registered ONCE and driven per op through
+    // tick(dt) (S3): age + integrate every live slot in place. Zero allocation --
+    // direct indexed reads and writes on the lanes handed in by tick(). Routing it
+    // through tick() puts the new hot entry point (typeof + >= 0 + clamp + call)
+    // INSIDE the measured window, so a regression that made tick() allocate, or
+    // that de-inlined the callback dispatch into an allocation, shows here.
+    const aged = function (dt, x, y, vx, vy, life, invLife, data, max) {
+        for (let s = 0; s < max; s++) {
             if (life[s] <= 0) continue;
-            life[s] -= DT;
-            vy[s] += 400 * DT;
-            x[s] += vx[s] * DT;
-            y[s] += vy[s] * DT;
+            life[s] -= dt;
+            vy[s] += 400 * dt;
+            x[s] += vx[s] * dt;
+            y[s] += vy[s] * dt;
             // Touch the published alpha expression so a regression that made it
             // allocate (it must not) would show here too.
             const a = life[s] * invLife[s];
             if (a < 0) x[s] += 0; // never taken; keeps `a` live without a branch cost
         }
+    };
+    engine.onTick(aged);
+
+    const hot = (i) => {
+        const idx = i & (N - 1);
+        // One emit per op: safe finite values, life above the P-05 floor.
+        engine.emit(px[idx], py[idx], pvx[idx], pvy[idx], 0.5 + (idx & 7) * 0.1, idx & 15);
+
+        // Advance the simulation through the public hot-path stepping API.
+        engine.tick(DT);
 
         if (BREAK) leak.push(new Float64Array(64)); // control: retained growth
     };

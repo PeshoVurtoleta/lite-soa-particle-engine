@@ -174,9 +174,39 @@ if (process.env.CEILING_CHILD !== undefined) {
 
 // --------------------------------------------------------------- parent mode
 const quick = process.argv.includes('--quick');
+
+/**
+ * Reclaimable memory (P-25). `os.freemem()` reports only the truly-free page pool;
+ * on macOS (and to a lesser degree Linux) a large share of RAM sits in INACTIVE /
+ * PURGEABLE / file-backed pages that the kernel hands back on demand without
+ * swapping. Ignoring them undercounts what is available, so the candidate's touch
+ * is skipped, C2 cannot be measured, and the identical tree that passed minutes
+ * ago now reports a criterion unmeasured. Count the reclaimable pool in the budget
+ * so the measurement can actually run. Test infra only; parses `vm_stat` on
+ * darwin, falls back to `os.freemem()` everywhere else.
+ */
+function reclaimableExtraBytes() {
+    if (process.platform !== 'darwin') return 0;
+    try {
+        const out = spawnSync('vm_stat', [], { encoding: 'utf8', timeout: 5000 }).stdout || '';
+        const pageM = out.match(/page size of (\d+) bytes/);
+        const pageSize = pageM ? Number(pageM[1]) : 4096;
+        const pagesOf = (label) => {
+            const m = out.match(new RegExp(label + ':\\s+(\\d+)\\.'));
+            return m ? Number(m[1]) : 0;
+        };
+        // Inactive + purgeable + speculative are reclaimable without swapping.
+        const pages = pagesOf('Pages inactive') + pagesOf('Pages purgeable') + pagesOf('Pages speculative');
+        return pages * pageSize;
+    } catch {
+        return 0;
+    }
+}
+
 const freeBytes = os.freemem();
+const availableBytes = freeBytes + reclaimableExtraBytes();
 /** Do not touch a footprint we cannot hold: swapping is not a measurement. */
-const TOUCH_LIMIT_BYTES = Math.max(0, freeBytes * 0.45);
+const TOUCH_LIMIT_BYTES = Math.max(0, availableBytes * 0.45);
 
 function runOne(n, touch, door) {
     const r = spawnSync(process.execPath, [SELF], {
@@ -229,8 +259,9 @@ console.log('machine  : ' + os.cpus()[0].model + ', ' + (os.totalmem() / 2 ** 30
     ' GB RAM, node ' + process.version);
 console.log('candidate: ' + pow2(CANDIDATE) + ' = ' + CANDIDATE + ' particles = ' +
     mb(CANDIDATE * BYTES_PER_PARTICLE) + ' MB across ' + LANES + ' lanes');
-console.log('touch cap: ' + mb(TOUCH_LIMIT_BYTES) + ' MB (45% of free RAM; larger sizes are ' +
-    'constructed but not touched, and are reported as such)');
+console.log('touch cap: ' + mb(TOUCH_LIMIT_BYTES) + ' MB (45% of available RAM = free ' +
+    mb(freeBytes) + ' MB + reclaimable ' + mb(availableBytes - freeBytes) + ' MB; larger ' +
+    'sizes are constructed but not touched, and are reported as such)');
 console.log('');
 console.log('  size            particles     footprint   status            construct   touch      RSS delta');
 console.log('  --------------- ------------- ----------- ----------------- ----------- ---------- -----------');
@@ -269,22 +300,34 @@ const abortThreshold = aborts.length ? aborts[0] : Infinity;
 const throwers = rows.filter((r) => r.status === 'THREW');
 const expectedRss = CANDIDATE * BYTES_PER_PARTICLE;
 
+// P-25: a criterion whose evidence could not be MEASURED (as opposed to measured
+// and failed) reports SKIP, never PASS and never FAIL. C2/C3/C4 all require the
+// candidate to have been TOUCHED; if the available-RAM budget prevented that, the
+// gate is inconclusive, not failed -- the candidate was never shown broken.
+const touchMeasured = !!(cand && cand.touched === true);
+const skipDetail = 'candidate not touched (available RAM budget ' + mb(TOUCH_LIMIT_BYTES) +
+    ' MB < footprint ' + mb(expectedRss) + ' MB) -- UNMEASURED, re-run with more free RAM';
+
 const checks = [
     ['C1 candidate constructs',
         cand && cand.status === 'CONSTRUCTED',
         cand ? cand.status : 'missing'],
     ['C2 all 7 lanes writable + read back',
-        cand && cand.touched === true && cand.readbackOk === true,
-        cand && cand.touched ? 'readbackOk=' + cand.readbackOk : 'NOT TOUCHED (raise free RAM and re-run)'],
+        touchMeasured ? (cand.readbackOk === true) : 'SKIP',
+        touchMeasured ? 'readbackOk=' + cand.readbackOk : skipDetail],
     ['C3 RSS within ' + (RSS_TOLERANCE * 100) + '% of analytic ' + mb(expectedRss) + ' MB',
-        cand && cand.rssDeltaBytes !== undefined &&
-        Math.abs(cand.rssDeltaBytes - expectedRss) <= expectedRss * RSS_TOLERANCE,
-        cand && cand.rssDeltaBytes !== undefined ? 'measured ' + mb(cand.rssDeltaBytes) + ' MB' : 'n/a'],
+        touchMeasured
+            ? (cand.rssDeltaBytes !== undefined &&
+               Math.abs(cand.rssDeltaBytes - expectedRss) <= expectedRss * RSS_TOLERANCE)
+            : 'SKIP',
+        touchMeasured && cand.rssDeltaBytes !== undefined ? 'measured ' + mb(cand.rssDeltaBytes) + ' MB' : skipDetail],
     ['C4 construct+touch <= ' + TIME_BUDGET_MS + ' ms',
-        cand && cand.constructMs !== undefined &&
-        (cand.constructMs + (cand.touchMs || 0)) <= TIME_BUDGET_MS,
-        cand && cand.constructMs !== undefined
-            ? (cand.constructMs + (cand.touchMs || 0)).toFixed(0) + ' ms' : 'n/a'],
+        touchMeasured
+            ? (cand.constructMs !== undefined &&
+               (cand.constructMs + (cand.touchMs || 0)) <= TIME_BUDGET_MS)
+            : 'SKIP',
+        touchMeasured && cand.constructMs !== undefined
+            ? (cand.constructMs + (cand.touchMs || 0)).toFixed(0) + ' ms' : skipDetail],
     // An unobserved abort is NOT evidence of margin -- it means the sweep never
     // reached the failure mode, so there is nothing to be 128x below. C5 must
     // fail in that case rather than pass on Infinity / CANDIDATE >= MARGIN.
@@ -322,27 +365,49 @@ const checks = [
 
 console.log('');
 console.log('VERDICT for MAX_PARTICLES = ' + pow2(CANDIDATE));
-let allOk = true;
+// Tri-state: a check's second element is `true` (PASS), `false` (FAIL), or the
+// literal string 'SKIP' (UNMEASURED). A skipped criterion is NEVER a pass.
+let anyFail = false;
+let anySkip = false;
 for (const [label, ok, detail] of checks) {
-    if (!ok) allOk = false;
-    console.log('  ' + (ok ? 'PASS' : 'FAIL') + '  ' + label.padEnd(54) + detail);
+    const status = ok === 'SKIP' ? 'SKIP' : (ok ? 'PASS' : 'FAIL');
+    if (status === 'FAIL') anyFail = true;
+    if (status === 'SKIP') anySkip = true;
+    console.log('  ' + status + '  ' + label.padEnd(54) + detail);
 }
 console.log('');
-if (allOk) {
-    const usable = rows.filter((r) => r.readbackOk === true).map((r) => r.n);
-    const overBudget = usable.filter((n) => n * BYTES_PER_PARTICLE > PORTABILITY_BUDGET_BYTES);
-    console.log('ok -- ' + pow2(CANDIDATE) + ' is supported by measurement.');
-    console.log('     C6 is load-bearing: there is no size at which the allocator fails');
-    console.log('     politely, so validation is the only thing preventing the abort.');
-    if (overBudget.length) {
-        console.log('     C7 is what picks BETWEEN the working sizes. Also fully usable on');
-        console.log('     this machine: ' + overBudget.map(pow2).join(', ') + ' -- rejected not because they');
-        console.log('     failed here but because they exceed the ' + mb(PORTABILITY_BUDGET_BYTES) +
-            ' MB budget a shipped');
-        console.log('     constant has to honour on the smallest targeted device.');
-    }
-    process.exit(0);
+
+if (anyFail) {
+    // A genuine measured failure takes precedence over any unmeasured criterion:
+    // the candidate was shown broken.
+    console.log('FAIL -- the candidate is NOT supported. Per the pre-committed fail action,');
+    console.log('        pick another value from the table above. Do not widen a criterion.');
+    process.exit(1);
 }
-console.log('FAIL -- the candidate is NOT supported. Per the pre-committed fail action,');
-console.log('        pick another value from the table above. Do not widen a criterion.');
-process.exit(1);
+
+if (anySkip) {
+    // The load-bearing rule (P-25): a criterion that did not run must never report
+    // PASS, and the run as a whole must not claim support it did not measure. This
+    // is distinct from FAIL -- nothing was shown broken -- and still exits non-zero
+    // so CI cannot mistake an unmeasured run for a green one. S3.1's T8 (peers
+    // absent) is the next gate that needs this status to exist.
+    console.log('INCONCLUSIVE -- one or more criteria could not be MEASURED on this host');
+    console.log('        (see SKIP above). The candidate was NOT shown broken, but neither');
+    console.log('        was it proven supported. Re-run on a host with more free/reclaimable');
+    console.log('        RAM. An unmeasured run is not a pass.');
+    process.exit(2);
+}
+
+const usable = rows.filter((r) => r.readbackOk === true).map((r) => r.n);
+const overBudget = usable.filter((n) => n * BYTES_PER_PARTICLE > PORTABILITY_BUDGET_BYTES);
+console.log('ok -- ' + pow2(CANDIDATE) + ' is supported by measurement.');
+console.log('     C6 is load-bearing: there is no size at which the allocator fails');
+console.log('     politely, so validation is the only thing preventing the abort.');
+if (overBudget.length) {
+    console.log('     C7 is what picks BETWEEN the working sizes. Also fully usable on');
+    console.log('     this machine: ' + overBudget.map(pow2).join(', ') + ' -- rejected not because they');
+    console.log('     failed here but because they exceed the ' + mb(PORTABILITY_BUDGET_BYTES) +
+        ' MB budget a shipped');
+    console.log('     constant has to honour on the smallest targeted device.');
+}
+process.exit(0);

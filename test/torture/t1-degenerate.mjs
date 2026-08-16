@@ -242,7 +242,10 @@ export function run() {
 
     // --- dt into the frame path (P-02): the loop now CLAMPS to maxDt instead of
     // fabricating a fixed 0.016 frame for any gap > 100ms. A clamped frame loses
-    // the excess time by design.
+    // the excess time by design. S3/D8: _loop() also validates the clock reading
+    // (`typeof time === 'number' && time >= _lastTime`) and does NOT advance
+    // _lastTime or invoke the callback on a bad reading -- so a backwards or NaN
+    // clock self-heals instead of poisoning _lastTime permanently.
     {
         const dtOf = (gapMs, opts) => {
             let dt = NaN;
@@ -259,7 +262,10 @@ export function run() {
         check(dtOf(0) === 0, () => 'T1.dt(0ms): expected 0, got ' + dtOf(0));
         check(Math.abs(dtOf(99.9) - 0.0999) < 1e-9, () => 'T1.dt(99.9ms): expected 0.0999, got ' + dtOf(99.9));
         check(Math.abs(dtOf(100) - 0.1) < 1e-9, () => 'T1.dt(100ms): expected 0.1, got ' + dtOf(100));
-        check(Math.abs(dtOf(-1) - -0.001) < 1e-9, () => 'T1.dt(-1ms): expected -0.001 (negative untouched), got ' + dtOf(-1));
+        // FLIPPED (D8): a backwards clock reading (time < _lastTime) is now
+        // REJECTED -- the callback is not invoked, so dt is never assigned and
+        // stays NaN. v1.0.5 passed the raw -0.001 through ("negative untouched").
+        check(Number.isNaN(dtOf(-1)), () => 'T1.dt(-1ms): D8 -- a backwards clock reading is rejected, callback not invoked, got ' + dtOf(-1));
 
         // Gaps > maxDt are clamped to EXACTLY maxDt (0.1), never fabricated to 0.016.
         for (const gap of [100.1, 101, 200, 5000]) {
@@ -277,9 +283,12 @@ export function run() {
         check(Math.abs(dtOf(50, { maxDt: 0.25 }) - 0.05) < 1e-9,
             () => 'T1.dt(50ms, maxDt 0.25): under the clamp, expected 0.05, got ' + dtOf(50, { maxDt: 0.25 }));
 
-        // A NaN timestamp still yields NaN dt (NaN > maxDt is false); Infinity now
-        // clamps to 0.1 (Infinity > 0.1 is true).
-        check(Number.isNaN(dtOf(NaN)), () => 'T1.dt(NaN): expected NaN dt, got ' + dtOf(NaN));
+        // A NaN timestamp yields NaN dt -- but now because D8's `time >= _lastTime`
+        // gate REJECTS it (NaN >= 0 is false), so the callback is not invoked,
+        // rather than the old reason (NaN reaching the clamp, NaN > maxDt false).
+        // Infinity is a valid forward reading (Infinity >= 0), so dt = Infinity
+        // reaches tick() and clamps to 0.1 (Infinity > 0.1 is true).
+        check(Number.isNaN(dtOf(NaN)), () => 'T1.dt(NaN): D8 -- a NaN clock reading is rejected, callback not invoked, got ' + dtOf(NaN));
         check(dtOf(Infinity) === 0.1, () => 'T1.dt(Infinity): P-02 contract -- expected clamp to 0.1, got ' + dtOf(Infinity));
     }
 }

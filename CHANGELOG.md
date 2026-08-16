@@ -3,6 +3,181 @@
 All notable changes to `@zakkster/lite-soa-particle-engine` are documented here.
 The format follows Keep a Changelog; this project uses semantic versioning.
 
+## [1.1.0] - 2026-08-16
+
+Loop ownership. The engine owned `requestAnimationFrame` and did not own the
+physics -- exactly backwards. This release adds `tick(dt)` as the primary
+stepping API so a host game loop, a fixed-step accumulator, lite-scheduler or a
+worker can drive the engine with zero DOM, and it repairs three lifecycle
+defects that live in the exact `_loop`/`start`/`onTick` code the new API
+rebuilds. The policy is recorded in `decisions/0003-loop-ownership.md`, with the
+`maxDt: Infinity` widening recorded as an amendment to
+`decisions/0002-the-door.md`. This is a MINOR release: additive, non-breaking
+for every existing consumer.
+
+### Added
+- **`tick(dt)` -- the primary stepping API.** Advance the simulation by `dt`
+  seconds and invoke the onTick callback once, with no `requestAnimationFrame`
+  required. `start()`/`stop()` are now thin RAF wrappers that pump it.
+  `tick(dt)` is a NEW door: `dt` is a caller argument in the hot path, so it is
+  guarded exactly as `emit()`'s arguments are (decision D3) --
+  `!(typeof dt === 'number' && dt >= 0)`, type before value, one negation. The
+  `>= 0` half rejects `NaN` for free; the `typeof` half makes it throw-safe on
+  the P-24 corpus (`10n`, `Symbol()`, a throwing `valueOf`). `dt` is CLAMPED to
+  `maxDt` on the high side and REJECTED (not clamped) on the low side: clamping
+  `-1` to `0` would silently change what the caller asked for. Returns `true`
+  iff the callback ran, `false` on a rejected `dt` / no callback / destroyed
+  engine. Never throws.
+- **`maxDt: Infinity` is now admitted** (S3 amendment to `decisions/0002`). A
+  fixed-step caller sets it to disable the high-side clamp: `dt > Infinity` is
+  never true, so the clamp becomes a documented no-op and the hot path is
+  unchanged. The constructor predicate relaxes from `Number.isFinite(m) && m > 0`
+  to `typeof m === 'number' && m > 0`, which still rejects `NaN`, `0` and every
+  negative. The RangeError message drops the word "finite".
+
+### Fixed
+- **P-27 (S1) -- `onTick()` accepted any value and a non-callable crashed the
+  render loop.** `onTick(cb)` stored `cb` unvalidated; `_loop` then did
+  `if (this._onTick) this._onTick(...)`, so a truthy non-function threw a raw
+  `TypeError` from INSIDE the frame callback -- the exact failure `emit()`'s
+  never-throws contract exists to prevent. Repro: `e.onTick(42); e.start();
+  raf[0](16)` -> `TypeError: this._onTick is not a function`. `onTick()` now
+  throws a named library `TypeError` at the door (registration is cold, called
+  once); a function registers, `null`/`undefined` unregister (stored as `null`,
+  never `undefined`, so `tick()`/`_loop` test `=== null` rather than the
+  truthiness that let `42` through), anything else throws.
+- **P-28 (S1) -- a failed `start()` left the engine permanently unstartable.**
+  `start()` set `this._isRunning = true` and `this._lastTime` BEFORE reaching
+  `requestAnimationFrame`, so with no DOM the `ReferenceError` escaped with the
+  engine flagged running and no frame pending; every later `start()` returned
+  early on `if (this._isRunning) return;` and did nothing, forever -- even after
+  a real RAF was installed. Repro: `new SoaParticleEngine(4).start()` under plain
+  node -> throws with `e._isRunning === true`; install a counting
+  `requestAnimationFrame` and call `start()` again -> **0** RAF calls. `start()`
+  now validates `typeof requestAnimationFrame !== 'function'` BEFORE mutating any
+  state and throws a NAMED library `TypeError`, leaving `_isRunning`/`_lastTime`
+  untouched -- so the retry arms exactly one frame.
+- **P-26 (S2) -- `_loop()` re-armed RAF unconditionally after the callback.**
+  Even when the callback called `destroy()`/`stop()`, one orphaned frame was left
+  pending on a torn-down engine. Repro: `onTick(() => e.destroy())`, pump one
+  frame -> `e._destroyed === true` and `PUMP.pending() === true`. `_loop` now
+  re-arms only when `this._isRunning && !this._destroyed`. The pinned torture
+  assertion (`test/torture/t4-handles.mjs`) is flipped from `pending() === true`
+  to `pending() === false`, and a T9 control reverts the guard and fails the
+  flipped pin.
+- **D8 -- the clock is environment input; a bad reading no longer kills the
+  engine.** `_loop` wrote `_lastTime = time` BEFORE the callback ran, so a `NaN`
+  or backwards `time` poisoned `_lastTime` permanently: every later frame
+  computed `NaN`, `tick()` rejected it, and the engine went silently and
+  permanently dead while still burning a RAF slot per frame -- P-28's fail-open
+  shape through the other door. `_loop` now validates
+  `typeof time === 'number' && time >= this._lastTime` and does NOT advance
+  `_lastTime` on a bad reading, so a transient bad sample self-heals and a
+  persistently broken clock is a visible no-op instead of a silent death. Repro:
+  `_loop(NaN)` then `_loop(200)` -> `_lastTime` is 200 and dt is finite, not
+  stuck at `NaN`.
+
+### Changed
+- **P-09 receipt half -- `emit()` returns the written slot index, or `-1`.**
+  Previously `void`, so a caller could not learn which slot was written. All
+  seven early-return paths return `-1` (one rejection value, no `undefined` in
+  the return type) and the success path returns the index. The index is a
+  RECEIPT, not an identity: valid until that slot is reused. Repro:
+  `emit(0,0,0,0,1) === 0`, the next `=== 1`, `emit(NaN,0,0,0,1) === -1` with the
+  cursor unmoved. **P-09's determinism half** (the README `Deterministic: Yes`
+  claim and the injectable RNG that makes it true) is NOT in this release -- it
+  ships with `emitBurst` in S3.1.
+
+### Closed (declined)
+- **P-12 -- no public `head` getter.** S1 already removed `._head` from
+  `llms.txt`. The remaining "or promote it to a public getter" half is DECLINED
+  (decision D5): the `emit()` receipt now tells a caller the slot it just wrote,
+  which is what reading `head` approximated, and a getter is new public surface
+  with a what-does-it-return-after-`destroy()` question and no consumer. If S4's
+  managed mode needs an exposed cursor it will be `aliveCount`, a different
+  number. P-12 is closed.
+
+### Known issues (recorded, not repaired)
+- **P-29 (S1, open) -- the D8 clock guard does not self-heal from a large
+  FORWARD reading.** Found by S3 qa, after the reviewer had approved the diff,
+  by attacking the one side of the predicate the decision record did not bound.
+  `_loop` accepts any `time` satisfying `time >= this._lastTime`, so a single
+  anomalous forward sample is taken as a legitimate frame and raises
+  `_lastTime` permanently; every later real-clock sample is smaller, fails the
+  guard forever, and the engine goes silently and permanently dead while still
+  burning a RAF slot per frame. Realistic trigger: a RAF polyfill handing back
+  a different clock basis for one frame (`Date.now()` ~1.7e12 against
+  `performance.now()`'s small domain). Repro: `e._isRunning = true;
+  e._lastTime = 0; e._loop(1e15);` then pump 50 frames from `now = 5000` -- the
+  callback fires once and never again.
+
+  **Not a regression.** The same input under 1.0.5's unconditional-advance
+  `_loop` delivered `dt === -999999999995` to the callback on the very next
+  frame -- a negative step of ~31,000 years that poisons every lane it touches
+  -- before recovering. 1.1.0 trades lane corruption for a stopped loop, which
+  is the better failure under law 4, but "better" is not "closed". Deliberately
+  not patched here: a bound on a forward reading is new policy (what magnitude
+  is anomalous, against which basis) and adding it after review is the
+  mid-flight scope widening the S2 -> S2.1 split exists to prevent. Pinned as
+  current behaviour in `test/qa-s3.test.js`; the D8 section of
+  `decisions/0003-loop-ownership.md` carries the limit. Scheduled with S4.
+
+### Testing
+- **P-25 (test infrastructure only, no shipped code) -- `bench:ceiling` gained a
+  third verdict.** It reported `FAIL` when it merely could not MEASURE: on macOS
+  `os.freemem()` ignores reclaimable inactive/purgeable pages, so the candidate's
+  touch was skipped and C2 failed spuriously (the identical tree failed and
+  passed within minutes). Reclaimable memory is now counted in the touch budget
+  (parsed from `vm_stat` on darwin), and a criterion that could not be measured
+  reports `SKIP`; a run with any `SKIP` and no `FAIL` prints `INCONCLUSIVE` and
+  exits non-zero -- never `PASS`. The rule this establishes outlives the bench: a
+  criterion that did not run must never report PASS. S3.1's T8 (peers absent) is
+  the next gate that needs this status to exist.
+- Torture: three `t4-handles.mjs` pins flipped (P-08 ReferenceError -> named
+  TypeError, P-09 `undefined` -> slot index, P-26 orphaned re-arm -> none), plus
+  the new `onTick`/`tick`/`start()`-retry/poisoned-clock cases. T0 gained the
+  `tick` false-return byte-identity + callback-counter law and the
+  `tick(a);tick(b) == tick(a+b)` additivity law over a gravity-free
+  constant-velocity body. T5 is filled: an AoS oracle differentially checks
+  10,000 `tick(dt)` frames, with rejected emits and clamped/rejected dt inside
+  the corpus. T6 routes its aging loop through `tick(dt)` so the new hot entry
+  point is inside the zero-alloc window. T9 gained one control per new gate
+  (bare-clamp `tick`, unvalidated `onTick`, mutate-before-validate `start()`,
+  unguarded `_loop` re-arm, the D8 `_lastTime` revert, and a deliberately-wrong
+  T5 oracle), each shown non-vacuous first and each exiting non-zero when armed.
+- The `{ maxDt: Infinity }` node:test is inverted from throws-RangeError to
+  constructs, and the `llms.txt` documented-rejection-contract test is extended
+  to cover `tick`'s rejection set so the doc and the new door cannot drift.
+
+### Performance
+`tick(dt)` is a new hot entry -- one `typeof`, one `>=`, one clamp compare, one
+`=== null`, one call, no closure/`arguments`/destructuring/default-object. It is
+added to the T6 zero-alloc gate (`maxMajor: 0`, `maxPauseMs: 4`,
+`maxArrayBuffersGrowth: 0`, all seven lane `buffer.byteLength` pinned, 0 B/op).
+`emit()`'s added `return i` is an integer already in a register. `_loop` now
+makes a real method call to `tick` where the body was inlined; V8 inlines it,
+which is why `tick` is measured under T6 rather than assumed.
+
+**Throughput this release is UNMEASURED, and no number is quoted because none
+can be trusted.** `npm run bench:emit:selftest` is run first by protocol, and
+it FAILED three times in a row on this host, resolving -6.2%, -7.2% and -7.6%
+between two BYTE-IDENTICAL implementations. A gate that cannot stay silent on
+identical code cannot be trusted to speak on different code, so every verdict
+from the same run is void -- including that run's own
+`RESOLVED. |-5.4%| > R=5.4%`, which claims a regression SMALLER than the noise
+the selftest just demonstrated, and which an earlier draft of this section
+mistakenly reported as "below R, no measurable change". It was not below R; the
+R was understated. `test/bench-emit.mjs` is untouched by this session
+(confirmed against `git status`), so the instability is ambient to the host --
+the bimodal P/E-core behaviour recorded in `decisions/0002-the-door.md` -- and
+not a property of this diff.
+
+The claim that actually matters is unaffected and is proven independently:
+**zero allocation on the hot path**, gated by T6 under `maxMajor: 0`,
+`maxPauseMs: 4`, `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'` and all
+seven lane `buffer.byteLength` values pinned. That gate passes. Throughput
+parity is a separate claim and this release does not make it.
+
 ## [1.0.5] - 2026-08-15
 
 The last hinge. v1.0.4 closed the door on `life` and left the other four lanes

@@ -19,6 +19,8 @@
 import { SoaParticleEngine, LIFE_MIN, LIFE_MAX, LANE_MAX } from '../../SoaParticleEngine.js';
 import { runOpsGate, headInvariant, snapshotLaneBytes, die } from './harness.mjs';
 import { run as t1 } from './t1-degenerate.mjs';
+import { run as t4 } from './t4-handles.mjs';
+import { makeOracle, diverge, integrateLanes } from './t5-fuzz.mjs';
 
 /** Retained sink so the control's allocations survive GC (arrayBuffers grows). */
 const leak = [];
@@ -47,6 +49,24 @@ const DROP_TYPEOF = process.env.SOA_TORTURE_DROP_TYPEOF === '1';
  * Run both ways and compare exit codes.
  */
 const DROP_DATAFLAG_TYPEOF = process.env.SOA_TORTURE_DROP_DATAFLAG_TYPEOF === '1';
+
+/**
+ * S3 whole-tier controls, one per new gate. Each reverts a shipped method
+ * process-wide and re-runs the T4 tier, whose corresponding flipped/new pin MUST
+ * die. Run both ways and compare exit codes: a control you did not observe failing
+ * is not a control.
+ *   SOA_TORTURE_TICK_BARE_CLAMP     -- tick() with dt's typeof + low-side guard
+ *                                      dropped to a bare `dt > maxDt` clamp (D3).
+ *   SOA_TORTURE_ONTICK_NO_VALIDATE  -- onTick() stores any value unvalidated (P-27).
+ *   SOA_TORTURE_START_MUTATE_FIRST  -- start() mutates state before the RAF check (P-28).
+ *   SOA_TORTURE_LOOP_UNGUARDED_REARM-- _loop() re-arms RAF unconditionally (P-26).
+ *   SOA_TORTURE_LOOP_ADVANCE_ALWAYS -- _loop() advances _lastTime on a bad clock (D8).
+ */
+const TICK_BARE_CLAMP = process.env.SOA_TORTURE_TICK_BARE_CLAMP === '1';
+const ONTICK_NO_VALIDATE = process.env.SOA_TORTURE_ONTICK_NO_VALIDATE === '1';
+const START_MUTATE_FIRST = process.env.SOA_TORTURE_START_MUTATE_FIRST === '1';
+const LOOP_UNGUARDED_REARM = process.env.SOA_TORTURE_LOOP_UNGUARDED_REARM === '1';
+const LOOP_ADVANCE_ALWAYS = process.env.SOA_TORTURE_LOOP_ADVANCE_ALWAYS === '1';
 
 /**
  * The reverted emit: v1.0.4's Number.isFinite guard for x/y/vx/vy (which passes
@@ -120,6 +140,55 @@ function noTypeofDataFlagEmit(x, y, vx, vy, life, dataFlag = 0) {
     this._head = (i + 1) % this.max;
 }
 
+/**
+ * The reverted tick(): the shipped clamp with the typeof + low-side `dt >= 0`
+ * guard DROPPED to a bare `dt > maxDt` clamp (the pre-D3 shape). '0.05' coerces
+ * past the clamp and is handed to the callback; -1 runs the sim backwards;
+ * Symbol() throws in the relational operator. Installed only under the env var.
+ */
+function bareClampTick(dt) {
+    if (this._destroyed) return false;
+    if (dt > this.maxDt) dt = this.maxDt; // bare clamp: no typeof, no low-side reject
+    if (this._onTick === null) return false;
+    this._onTick(dt, this.x, this.y, this.vx, this.vy, this.life, this.invLife, this.data, this.max);
+    return true;
+}
+
+/** The reverted onTick(): stores any value unvalidated (P-27). */
+function unvalidatedOnTick(callback) {
+    this._onTick = callback;
+}
+
+/** The reverted start(): mutates _isRunning/_lastTime BEFORE the RAF check (P-28). */
+function mutateFirstStart() {
+    if (this._isRunning || this._destroyed) return;
+    this._isRunning = true;
+    this._lastTime = performance.now();
+    this._rafId = requestAnimationFrame(this._loop); // throws AFTER mutating when no RAF
+}
+
+/** The reverted _loop(): re-arms RAF unconditionally after the callback (P-26). */
+function unguardedRearmLoop(time) {
+    if (!this._isRunning || this._destroyed) return;
+    if (typeof time === 'number' && time >= this._lastTime) {
+        const dt = (time - this._lastTime) / 1000;
+        this._lastTime = time;
+        this.tick(dt);
+    }
+    this._rafId = requestAnimationFrame(this._loop); // UNCONDITIONAL re-arm
+}
+
+/** The reverted _loop(): advances _lastTime on ANY clock reading (the D8 revert). */
+function advanceAlwaysLoop(time) {
+    if (!this._isRunning || this._destroyed) return;
+    const dt = (time - this._lastTime) / 1000;
+    this._lastTime = time; // advanced unconditionally -- a NaN reading poisons it forever
+    this.tick(dt);
+    if (this._isRunning && !this._destroyed) {
+        this._rafId = requestAnimationFrame(this._loop);
+    }
+}
+
 export function run() {
     // Control 1 -- the alloc gate. A hot body that retains an allocation every
     // iteration MUST be rejected by runOpsGate (maxArrayBuffersGrowth:0). Proven
@@ -187,25 +256,34 @@ export function run() {
         e.destroy();
     }
 
-    // Control 5 -- the P-02 dt clamp law. T1 asserts "a gap > maxDt clamps to
-    // EXACTLY maxDt". Prove that law CATCHES the reverted rule: apply the old
-    // 0.016-fabrication as a local function and assert the T1 predicate (a 101 ms
-    // gap yields maxDt) is FALSE for it, then TRUE for the real engine. A law the
-    // buggy rule passes is decorative.
+    // Control 5 -- the dt clamp law, now measured through tick() (R6). After S3
+    // task 5 _loop() no longer clamps: it computes dt from the clock and delegates
+    // to tick(), where the single clamp site lives. So a 101 ms gap driven through
+    // _loop measures TICK's clamp, not _loop's -- relabelled accordingly. Prove the
+    // law CATCHES the reverted 0.016 fabrication, then holds for the real engine
+    // via BOTH paths: _loop(101) (the clock path) and tick(0.101) (direct).
     {
         const maxDt = 0.1;
         const oldRule = (gapMs) => { let dt = gapMs / 1000; if (dt > 0.1) dt = 0.016; return dt; };
-        // Old rule on a 101 ms gap fabricates 0.016, so the T1 predicate is false.
-        if (oldRule(101) === maxDt) die('T9 control: the reverted 0.016 dt rule passed the T1 clamp law (the law cannot catch P-02)');
+        // Old rule on a 101 ms gap fabricates 0.016, so the clamp predicate is false.
+        if (oldRule(101) === maxDt) die('T9 control: the reverted 0.016 dt rule passed the clamp law (the law cannot catch P-02)');
 
+        // Path A -- the clock path: _loop(101) -> tick(0.101) -> clamp to maxDt.
         const e = new SoaParticleEngine(4);
         let dt = NaN;
         e.onTick((d) => { dt = d; });
         e._isRunning = true;
         e._lastTime = 0;
         e._loop(101);
+        if (dt !== maxDt) die('T9 control: _loop(101) -> tick clamp failed (dt=' + dt + ')');
+
+        // Path B -- tick() directly: the clamp site under test, no clock involved.
+        let dt2 = NaN;
+        e.onTick((d) => { dt2 = d; });
+        e._isRunning = false;
+        if (e.tick(0.101) !== true) die('T9 control: tick(0.101) unexpectedly rejected');
+        if (dt2 !== maxDt) die('T9 control: tick(0.101) did not clamp to maxDt (dt=' + dt2 + ')');
         e.destroy();
-        if (dt !== maxDt) die('T9 control: the real engine failed the T1 clamp law on a 101 ms gap (dt=' + dt + ')');
     }
 
     // Control 6 -- the constructor-validation law is not vacuous. T1 asserts every
@@ -308,5 +386,76 @@ export function run() {
         try { e.emit(0, 0, 0, 0, 1, 10n); } catch (err) { threw = String(err); }
         if (threw) die('T9 control: SOA_TORTURE_DROP_DATAFLAG_TYPEOF made emit() THROW on a BigInt dataFlag (P-24), as it must -- ' + threw);
         die('T9 control: SOA_TORTURE_DROP_DATAFLAG_TYPEOF did not make emit() throw -- the P-24 pin cannot catch the regression');
+    }
+
+    // Control 13 -- the T5 differential comparator is not vacuous. A CORRECT oracle
+    // tracks the engine tuple-for-tuple (diverge returns null); a DELIBERATELY
+    // WRONG oracle (a different gravity) is flagged. A comparator that passed both
+    // would certify nothing. life is kept high so no particle expires -- a wrong
+    // oracle is invisible if everything is already dead.
+    {
+        const maxDt = 0.1;
+        const e = new SoaParticleEngine(16, { maxDt });
+        e.onTick(integrateLanes);
+        const good = makeOracle(16, maxDt);        // default gravity -- matches the engine
+        const bad = makeOracle(16, maxDt, 800);    // wrong gravity -- must be caught
+        for (let i = 0; i < 16; i++) {
+            const x = i - 8, y = i, vx = (i & 3) - 1, vy = 1, life = 5.0, flag = i;
+            e.emit(x, y, vx, vy, life, flag);
+            good.emit(x, y, vx, vy, life, flag);
+            bad.emit(x, y, vx, vy, life, flag);
+        }
+        for (let f = 0; f < 10; f++) { e.tick(0.05); good.tick(0.05); bad.tick(0.05); }
+        if (diverge(e, good, 1e-3) !== null)
+            die('T9 control: the T5 comparator flagged a CORRECT oracle (it is over-sensitive / broken)');
+        if (diverge(e, bad, 1e-3) === null)
+            die('T9 control: the T5 comparator did NOT flag a wrong-gravity oracle (it cannot catch physics divergence)');
+        e.destroy();
+    }
+
+    // Control 14 -- WHOLE-TIER tick() revert (SOA_TORTURE_TICK_BARE_CLAMP=1). Drop
+    // the typeof + low-side guard to a bare `dt > maxDt` clamp and re-run T4; its
+    // D3 dt pin MUST die ('0.05' is laundered / Symbol() throws / -1 accepted).
+    if (TICK_BARE_CLAMP) {
+        SoaParticleEngine.prototype.tick = bareClampTick;
+        t4();
+        die('T9 control: SOA_TORTURE_TICK_BARE_CLAMP reverted tick() but T4 still passed (the D3 dt pin cannot catch the bare clamp)');
+    }
+
+    // Control 15 -- WHOLE-TIER onTick() revert (SOA_TORTURE_ONTICK_NO_VALIDATE=1).
+    // Store any value unvalidated and re-run T4; its P-27 pin MUST die (onTick(42)
+    // no longer throws at the door).
+    if (ONTICK_NO_VALIDATE) {
+        SoaParticleEngine.prototype.onTick = unvalidatedOnTick;
+        t4();
+        die('T9 control: SOA_TORTURE_ONTICK_NO_VALIDATE reverted onTick() but T4 still passed (the P-27 pin cannot catch the unvalidated store)');
+    }
+
+    // Control 16 -- WHOLE-TIER start() revert (SOA_TORTURE_START_MUTATE_FIRST=1).
+    // Mutate _isRunning/_lastTime before the RAF check and re-run T4; its P-08/P-28
+    // pin MUST die (a failed start() leaves the engine running and the throw is a
+    // bare ReferenceError, not the named library error).
+    if (START_MUTATE_FIRST) {
+        SoaParticleEngine.prototype.start = mutateFirstStart;
+        t4();
+        die('T9 control: SOA_TORTURE_START_MUTATE_FIRST reverted start() but T4 still passed (the P-28 pin cannot catch mutate-before-validate)');
+    }
+
+    // Control 17 -- WHOLE-TIER _loop() re-arm revert (SOA_TORTURE_LOOP_UNGUARDED_REARM=1).
+    // Re-arm RAF unconditionally and re-run T4; its flipped P-26 pin MUST die (a
+    // destroy()-during-onTick leaves an orphaned frame, PUMP.pending() === true).
+    if (LOOP_UNGUARDED_REARM) {
+        SoaParticleEngine.prototype._loop = unguardedRearmLoop;
+        t4();
+        die('T9 control: SOA_TORTURE_LOOP_UNGUARDED_REARM reverted the re-arm but T4 still passed (the P-26 pin cannot catch the orphaned frame)');
+    }
+
+    // Control 18 -- WHOLE-TIER _loop() clock revert (SOA_TORTURE_LOOP_ADVANCE_ALWAYS=1).
+    // Advance _lastTime on any clock reading (the D8 revert) and re-run T4; its D8
+    // self-heal pin MUST die (a NaN reading poisons _lastTime permanently).
+    if (LOOP_ADVANCE_ALWAYS) {
+        SoaParticleEngine.prototype._loop = advanceAlwaysLoop;
+        t4();
+        die('T9 control: SOA_TORTURE_LOOP_ADVANCE_ALWAYS reverted the clock guard but T4 still passed (the D8 pin cannot catch _lastTime poisoning)');
     }
 }

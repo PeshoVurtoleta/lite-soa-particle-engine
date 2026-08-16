@@ -28,9 +28,11 @@ import { SoaParticleEngine } from '../../SoaParticleEngine.js';
 import { check, PUMP } from './harness.mjs';
 
 export function run() {
-    // --- P-08: start() calls requestAnimationFrame unconditionally, and Node
-    // has no such global. Save + restore the two hooks the shared PUMP (see
-    // harness.mjs) installed so every OTHER tier is unaffected.
+    // --- P-08 / P-28 (D2): start() validates the environment BEFORE mutating any
+    // state and throws a NAMED library TypeError with no requestAnimationFrame --
+    // not the bare ReferenceError v1.0.5 leaked. Save + restore the two hooks the
+    // shared PUMP (see harness.mjs) installed so every OTHER tier is unaffected.
+    // FLIPPED from the ReferenceError pin: the change is visible and deliberate.
     {
         const savedRaf = globalThis.requestAnimationFrame;
         const savedCaf = globalThis.cancelAnimationFrame;
@@ -46,18 +48,32 @@ export function run() {
             globalThis.requestAnimationFrame = savedRaf;
             globalThis.cancelAnimationFrame = savedCaf;
         }
-        check(threw instanceof ReferenceError,
-            () => 'T4.P-08 pin: expected start() to throw a ReferenceError with no RAF shim, got ' + threw);
+        check(threw instanceof TypeError && /^SoaParticleEngine: /.test(String(threw.message)),
+            () => 'T4.P-08 pin (flipped, D2): expected start() to throw a NAMED library TypeError with no RAF, got ' + threw);
+        // Fail-closed (P-28): the throw left the engine untouched and retryable.
+        check(e._isRunning === false && e._lastTime === 0,
+            () => 'T4.P-28 pin: a failed start() must leave _isRunning=false and _lastTime=0, got ' +
+                e._isRunning + '/' + e._lastTime);
         e.destroy();
     }
 
-    // --- P-09: emit() returns void today -- no slot handle, so a caller cannot
-    // learn which slot was written. S3 changes the return to a slot index.
+    // --- P-09 (receipt half, D4): emit() returns the written slot index -- a
+    // receipt, not an identity. FLIPPED from the undefined pin: the first emit
+    // writes slot 0 and returns 0; the next returns 1; a rejected emit returns
+    // -1 and does not advance the cursor.
     {
         const e = new SoaParticleEngine(4);
-        const ret = e.emit(0, 0, 0, 0, 1);
-        check(ret === undefined,
-            () => 'T4.P-09 pin: expected emit() to return undefined (no slot handle) today, got ' + String(ret));
+        const r0 = e.emit(0, 0, 0, 0, 1);
+        check(r0 === 0,
+            () => 'T4.P-09 pin (flipped, D4): expected emit() to return slot index 0, got ' + String(r0));
+        const r1 = e.emit(0, 0, 0, 0, 1);
+        check(r1 === 1,
+            () => 'T4.P-09 pin (flipped, D4): expected the second emit() to return slot index 1, got ' + String(r1));
+        const rejected = e.emit(NaN, 0, 0, 0, 1);
+        check(rejected === -1,
+            () => 'T4.P-09 pin (flipped, D4): expected a rejected emit() to return -1, got ' + String(rejected));
+        check(e._head === 2,
+            () => 'T4.P-09 pin (flipped, D4): a rejected emit must not advance the cursor, head=' + e._head);
         e.destroy();
     }
 
@@ -241,18 +257,13 @@ export function run() {
         e.destroy();
     }
 
-    // --- Adversarial case the planner did not name: dispose-during-iteration.
-    // _loop() calls onTick() and THEN unconditionally re-arms
-    // requestAnimationFrame(this._loop), even when onTick just called destroy().
-    // The re-arm is not guarded by _isRunning/_destroyed, so one orphaned frame
-    // is left pending on an already-destroyed engine. This does not throw and
-    // self-heals -- the very next frame hits the `if (!this._isRunning) return;`
-    // guard at the top of _loop before doing anything else, so onTick is never
-    // invoked twice and no second re-arm happens -- but the orphaned frame
-    // between destroy() and that guard firing IS an observable state (a real
-    // engine would see one wasted RAF callback after teardown). Pinned as
-    // CURRENT behaviour, not fixed here: SoaParticleEngine.js is out of scope
-    // for this QA stage. Reported separately as a finding.
+    // --- P-26 (D7): dispose-during-iteration. _loop() calls onTick() and re-arms
+    // requestAnimationFrame(this._loop) only when `_isRunning && !_destroyed`. If
+    // onTick just called destroy(), the guard sees _destroyed and does NOT re-arm,
+    // so NO orphaned frame is left pending on a torn-down engine. FLIPPED from the
+    // pinned-orphan assertion (PUMP.pending() === true) to the fixed contract
+    // (=== false): the change is visible and deliberate, and a T9 control reverts
+    // the guard and must fail this pin.
     {
         PUMP.reset();
         const e = new SoaParticleEngine(4);
@@ -270,13 +281,11 @@ export function run() {
         check(threw === null, () => 'T4.lifecycle: destroy() called from inside onTick threw ' + threw);
         check(e._destroyed === true, () => 'T4.lifecycle: expected the engine destroyed after the re-entrant call');
         check(ticks === 1, () => 'T4.lifecycle: expected onTick to fire exactly once, got ' + ticks);
-        // The orphaned re-arm: pin it so a future fix to _loop's re-arm guard is
-        // a visible, deliberate change to this exact assertion, not a silent one.
-        check(PUMP.pending() === true,
-            () => 'T4.lifecycle: expected the KNOWN orphaned re-arm after destroy()-during-onTick (pinned current behaviour)');
+        // The guarded re-arm: no frame is pending after destroy()-during-onTick.
+        check(PUMP.pending() === false,
+            () => 'T4.P-26 pin (flipped, D7): expected NO orphaned re-arm after destroy()-during-onTick, PUMP.pending()=' + PUMP.pending());
 
-        // Firing the orphaned frame must be harmless: no second onTick call, no
-        // throw, and no further re-arm once the top-of-_loop guard returns.
+        // A second pump has nothing armed to fire: no second onTick call, no throw.
         let threw2 = null;
         try {
             PUMP.setNow(32);
@@ -284,9 +293,174 @@ export function run() {
         } catch (err) {
             threw2 = err;
         }
-        check(threw2 === null, () => 'T4.lifecycle: firing the orphaned post-destroy frame threw ' + threw2);
-        check(ticks === 1, () => 'T4.lifecycle: the orphaned frame must not re-invoke onTick, got ticks=' + ticks);
+        check(threw2 === null, () => 'T4.lifecycle: pumping after a guarded re-arm threw ' + threw2);
+        check(ticks === 1, () => 'T4.lifecycle: no armed frame must re-invoke onTick, got ticks=' + ticks);
         check(PUMP.pending() === false,
-            () => 'T4.lifecycle: expected the orphaned frame to self-heal (no further re-arm)');
+            () => 'T4.lifecycle: still no frame pending after the second pump');
+    }
+
+    // =========================================================================
+    // S3 door: the cases the tier never got. onTick's registration door (P-27),
+    // tick(dt)'s new hot-path door (D3), and the lifecycle/clock sequences that
+    // prove D2 and D8 fail closed.
+    // =========================================================================
+
+    // --- P-27 (D6): onTick() throws at the door for a non-callable, and only for
+    // a non-callable. A function registers; null/undefined UNREGISTER (store null)
+    // and return normally; anything else is a named library TypeError. The frame
+    // path can then never throw for a registered value.
+    {
+        const e = new SoaParticleEngine(4);
+        for (const bad of [42, 'x', {}, [], true, 0, 10n, Symbol('s')]) {
+            let threw = null;
+            try { e.onTick(bad); } catch (err) { threw = err; }
+            check(threw instanceof TypeError && /^SoaParticleEngine: /.test(String(threw.message)),
+                () => 'T4.P-27: onTick(' + String(bad) + ') must throw a named TypeError, got ' + threw);
+        }
+        // A function registers.
+        const fn = function () {};
+        e.onTick(fn);
+        check(e._onTick === fn, () => 'T4.P-27: onTick(function) must register it');
+        // null and undefined unregister, storing NULL (never undefined) so tick()
+        // can test === null rather than truthiness (truthiness let 42 through).
+        e.onTick(null);
+        check(e._onTick === null, () => 'T4.P-27: onTick(null) must unregister (store null), got ' + String(e._onTick));
+        e.onTick(fn);
+        e.onTick(undefined);
+        check(e._onTick === null, () => 'T4.P-27: onTick(undefined) must unregister as null, got ' + String(e._onTick));
+        e.destroy();
+    }
+
+    // --- D3: tick(dt)'s hot-path door. The rejection corpus is emit()'s P-23/P-24
+    // corpus one entry point over: every coerced non-number and the throwing
+    // BigInt/Symbol/valueOf trio must be rejected with `false`, must NOT invoke the
+    // callback (counter asserted), and must NOT throw. dt of 0, -0 and exactly
+    // maxDt are accepted.
+    {
+        const e = new SoaParticleEngine(4);
+        let calls = 0;
+        e.onTick(function () { calls++; });
+
+        const rejects = [NaN, -1, '0.05', true, [0.05], null, undefined, 10n, Symbol('s'),
+            { valueOf() { throw new Error('boom'); } }, { [Symbol.toPrimitive]() { throw new Error('boom'); } }];
+        for (let k = 0; k < rejects.length; k++) {
+            const dt = rejects[k];
+            let threw = null;
+            let ret = true;
+            try { ret = e.tick(dt); } catch (err) { threw = err; }
+            check(threw === null,
+                () => 'T4.D3: tick(' + String(dt) + ') must NOT throw (P-24 corpus), threw ' + threw);
+            check(ret === false,
+                () => 'T4.D3: tick(' + String(dt) + ') must return false, got ' + String(ret));
+        }
+        check(calls === 0,
+            () => 'T4.D3: a rejected tick must NOT invoke the callback, callback ran ' + calls + ' times');
+
+        // Accepted low-side boundary values -- 0, -0 and exactly maxDt all run.
+        check(e.tick(0) === true, () => 'T4.D3: tick(0) must be accepted');
+        check(e.tick(-0) === true, () => 'T4.D3: tick(-0) must be accepted');
+        check(e.tick(e.maxDt) === true, () => 'T4.D3: tick(maxDt) must be accepted');
+        check(calls === 3, () => 'T4.D3: three accepted ticks must invoke the callback 3 times, got ' + calls);
+
+        // 1e9 is clamped to maxDt on the default engine.
+        let seen = NaN;
+        e.onTick(function (dt) { seen = dt; });
+        e.tick(1e9);
+        check(seen === e.maxDt, () => 'T4.D3: tick(1e9) must clamp to maxDt (' + e.maxDt + '), saw ' + seen);
+        e.destroy();
+    }
+
+    // --- D3: with maxDt Infinity the high-side clamp is a no-op -- a large dt is
+    // delivered unclamped, the fixed-step-accumulator contract.
+    {
+        const e = new SoaParticleEngine(4, { maxDt: Infinity });
+        let seen = NaN;
+        e.onTick(function (dt) { seen = dt; });
+        check(e.tick(1e9) === true, () => 'T4.D3: tick(1e9) under maxDt:Infinity must be accepted');
+        check(seen === 1e9, () => 'T4.D3: tick(1e9) under maxDt:Infinity must pass through unclamped, saw ' + seen);
+        e.destroy();
+    }
+
+    // --- tick() after destroy() returns false and never throws, with no callback
+    // invocation possible (the lanes are null).
+    {
+        const e = new SoaParticleEngine(4);
+        let calls = 0;
+        e.onTick(function () { calls++; });
+        e.destroy();
+        let threw = null;
+        let ret = true;
+        try { ret = e.tick(0.016); } catch (err) { threw = err; }
+        check(threw === null, () => 'T4.D3: tick() after destroy() threw ' + threw);
+        check(ret === false, () => 'T4.D3: tick() after destroy() must return false, got ' + String(ret));
+        check(calls === 0, () => 'T4.D3: tick() after destroy() must not invoke the callback, calls=' + calls);
+    }
+
+    // --- P-28: start() twice, and the failed-start retry sequence. A first start()
+    // with no RAF throws the named error and leaves the engine untouched; a second
+    // start() AFTER a real RAF is installed must arm exactly one frame. On v1.0.5
+    // this armed ZERO frames forever (the first start() set _isRunning before the
+    // throw). Uses a private, isolated pump so the shared PUMP is unaffected.
+    {
+        const savedRaf = globalThis.requestAnimationFrame;
+        const savedCaf = globalThis.cancelAnimationFrame;
+        delete globalThis.requestAnimationFrame;
+        delete globalThis.cancelAnimationFrame;
+        const e = new SoaParticleEngine(4);
+        let threw = null;
+        try { e.start(); } catch (err) { threw = err; }
+        check(threw instanceof TypeError, () => 'T4.P-28: the first start() with no RAF must throw a TypeError, got ' + threw);
+        check(e._isRunning === false, () => 'T4.P-28: a failed start() must leave _isRunning false, got ' + e._isRunning);
+
+        // Install a counting RAF and retry: exactly one frame armed.
+        let rafCount = 0;
+        globalThis.requestAnimationFrame = function () { rafCount++; return 1; };
+        globalThis.cancelAnimationFrame = function () {};
+        try {
+            e.start();
+        } finally {
+            globalThis.requestAnimationFrame = savedRaf;
+            globalThis.cancelAnimationFrame = savedCaf;
+        }
+        check(rafCount === 1, () => 'T4.P-28: the retried start() must arm exactly one RAF, got ' + rafCount);
+        check(e._isRunning === true, () => 'T4.P-28: the retried start() must set _isRunning');
+        // A second start() while running is idempotent -- no extra frame armed.
+        globalThis.requestAnimationFrame = function () { rafCount++; return 1; };
+        try { e.start(); } finally { globalThis.requestAnimationFrame = savedRaf; }
+        check(rafCount === 1, () => 'T4.P-28: a second start() while running must be idempotent, armed ' + rafCount);
+        e._isRunning = false; // drop the flag so destroy()/stop() do not touch the restored RAF
+        e.destroy();
+    }
+
+    // --- D8: the clock is environment input. A poisoned clock reading (NaN or a
+    // backwards time) must NOT advance _lastTime and must NOT invoke the callback,
+    // and a subsequent VALID reading must produce a correct finite dt -- the engine
+    // self-heals instead of dying permanently (P-28's shape through the clock door).
+    {
+        PUMP.reset();
+        const e = new SoaParticleEngine(4);
+        let last = NaN;
+        let calls = 0;
+        e.onTick(function (dt) { last = dt; calls++; });
+        e._isRunning = true;
+        e._lastTime = 100;
+
+        // A NaN clock reading: rejected, _lastTime unchanged, callback uninvoked.
+        e._loop(NaN);
+        check(e._lastTime === 100, () => 'T4.D8: a NaN clock reading must not advance _lastTime, got ' + e._lastTime);
+        check(calls === 0, () => 'T4.D8: a NaN clock reading must not invoke the callback, calls=' + calls);
+
+        // A backwards clock reading: same -- rejected, no advance, no callback.
+        e._loop(50);
+        check(e._lastTime === 100, () => 'T4.D8: a backwards clock reading must not advance _lastTime, got ' + e._lastTime);
+        check(calls === 0, () => 'T4.D8: a backwards clock reading must not invoke the callback, calls=' + calls);
+
+        // A valid forward reading: dt is finite and correct, and the engine heals.
+        e._loop(200);
+        check(e._lastTime === 200, () => 'T4.D8: a valid reading must advance _lastTime to 200, got ' + e._lastTime);
+        check(calls === 1, () => 'T4.D8: a valid reading after poison must invoke the callback once, calls=' + calls);
+        check(last === 0.1, () => 'T4.D8: dt for a 100ms advance must be 0.1 (clamped from (200-100)/1000), got ' + last);
+        e._isRunning = false;
+        e.destroy();
     }
 }

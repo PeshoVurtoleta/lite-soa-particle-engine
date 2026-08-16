@@ -124,6 +124,84 @@ export function run() {
             () => 'T0.alpha: birth alpha ' + alpha + ' out of [0,1] (seed=' + SEED + ' op=' + op + ')');
     }
 
+    // =====================================================================
+    // tick(dt) laws (S3). Two properties, on fresh engines so the emit corpus
+    // above is untouched.
+    // =====================================================================
+
+    // Law A -- a REJECTED tick leaves all seven lanes byte-identical AND does not
+    // invoke the callback. The callback here MUTATES every lane, so if it ran even
+    // once on a rejected dt the byte-identity check would catch it -- but a counter
+    // is asserted too, because a callback that ran and then exactly restored the
+    // lanes would fool the lanes alone.
+    {
+        const e = new SoaParticleEngine(MAX);
+        for (let i = 0; i < MAX; i++) e.emit(i - 32, i + 1, i & 7, -(i & 7), 0.5 + (i & 3) * 0.1, i);
+        let tickCalls = 0;
+        e.onTick(function (dt, x, y, vx, vy, life) {
+            tickCalls++;
+            for (let s = 0; s < MAX; s++) { x[s] += 1; y[s] -= 1; vx[s] += dt; life[s] -= dt; }
+        });
+        const bx = new Float32Array(MAX), by = new Float32Array(MAX);
+        const bvx = new Float32Array(MAX), bvy = new Float32Array(MAX);
+        const bl = new Float32Array(MAX), bi = new Float32Array(MAX);
+        const bd = new Int32Array(MAX);
+        bx.set(e.x); by.set(e.y); bvx.set(e.vx); bvy.set(e.vy); bl.set(e.life); bi.set(e.invLife); bd.set(e.data);
+
+        const rejects = [NaN, -1, '0.05', true, [0.05], null, undefined, 10n, Symbol('s'),
+            { valueOf() { throw new Error('boom'); } }];
+        for (let k = 0; k < rejects.length; k++) {
+            const ret = e.tick(rejects[k]);
+            check(ret === false, () => 'T0.tick.reject: tick(' + String(rejects[k]) + ') returned ' + String(ret) + ' not false (seed=' + SEED + ')');
+        }
+        check(tickCalls === 0, () => 'T0.tick.reject: a rejected tick invoked the callback ' + tickCalls + ' times (seed=' + SEED + ')');
+        for (let s = 0; s < MAX; s++) {
+            check(e.x[s] === bx[s] && e.y[s] === by[s] && e.vx[s] === bvx[s] && e.vy[s] === bvy[s] &&
+                e.life[s] === bl[s] && e.invLife[s] === bi[s] && e.data[s] === bd[s],
+                () => 'T0.tick.reject: a rejected tick mutated lane slot ' + s + ' (seed=' + SEED + ')');
+        }
+        e.destroy();
+    }
+
+    // Law B -- tick additivity for CONSTANT-VELOCITY integration (no gravity, no
+    // drag): tick(a); tick(b) equals tick(a+b) within an f32 tolerance. R7: this
+    // needs a gravity-free body -- with gravity, vy changes between sub-steps and
+    // the split integral no longer equals the single one, so the law is asserted
+    // over its own physics, never over the gravity corpus above.
+    {
+        const TICK_TOL = 1e-4; // f32 slack over a constant-velocity step
+        const A = 0.02, B = 0.03; // A + B = 0.05 <= maxDt, so no clamp differs
+        const integrate = function (dt, x, y, vx, vy, life, invLife, data, max) {
+            for (let s = 0; s < max; s++) {
+                if (life[s] <= 0) continue;
+                x[s] += vx[s] * dt;   // constant velocity -- vx/vy are NOT modified
+                y[s] += vy[s] * dt;
+                life[s] -= dt;
+            }
+        };
+        const split = new SoaParticleEngine(MAX);
+        const whole = new SoaParticleEngine(MAX);
+        for (let i = 0; i < MAX; i++) {
+            const x = i - 32, y = i + 5, vx = (i & 15) - 8, vy = 8 - (i & 15), life = 0.4 + (i & 7) * 0.1;
+            split.emit(x, y, vx, vy, life, i);
+            whole.emit(x, y, vx, vy, life, i);
+        }
+        split.onTick(integrate);
+        whole.onTick(integrate);
+        split.tick(A); split.tick(B);
+        whole.tick(A + B);
+        for (let s = 0; s < MAX; s++) {
+            check(Math.abs(split.x[s] - whole.x[s]) <= TICK_TOL,
+                () => 'T0.tick.additive: x slot ' + s + ' split=' + split.x[s] + ' whole=' + whole.x[s] + ' (seed=' + SEED + ')');
+            check(Math.abs(split.y[s] - whole.y[s]) <= TICK_TOL,
+                () => 'T0.tick.additive: y slot ' + s + ' split=' + split.y[s] + ' whole=' + whole.y[s] + ' (seed=' + SEED + ')');
+            check(Math.abs(split.life[s] - whole.life[s]) <= TICK_TOL,
+                () => 'T0.tick.additive: life slot ' + s + ' split=' + split.life[s] + ' whole=' + whole.life[s] + ' (seed=' + SEED + ')');
+        }
+        split.destroy();
+        whole.destroy();
+    }
+
     // Clear law: after clear(), no slot is alive and head === 0.
     engine.clear();
     check(engine._head === 0, () => 'T0.clear: head not 0 after clear (seed=' + SEED + ')');

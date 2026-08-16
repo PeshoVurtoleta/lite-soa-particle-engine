@@ -64,8 +64,9 @@ RangeError when it is a number outside the legal set (NaN, 2.5, 0, -1, Infinity,
            anything > MAX_PARTICLES)
 ```
 
-`maxDt` (new option, below) is validated the same way: a finite number > 0, or
-throw.
+`maxDt` (new option, below) is validated the same way: a number > 0, or throw.
+(S2 wrote "a finite number > 0"; the S3 amendment at the end of this record
+relaxes it to admit `Infinity`. See "Amendment -- 2026-08-16, v1.1.0".)
 
 Neither error is a new class. A subclassed error would be a public API surface
 this package does not want to maintain; the message prefix is what makes it
@@ -449,10 +450,48 @@ cost something, so it is measured, not asserted: `npm run bench:emit`, delta
 reported only if it exceeds the R measured in that same run, `bench:emit:selftest`
 run first to prove the harness can stay silent.
 
+## Amendment -- 2026-08-16, v1.1.0 (S3): `maxDt: Infinity` is admitted (D3)
+
+S3 adds `tick(dt)` as the primary stepping API (see
+`decisions/0003-loop-ownership.md`). A caller running a fixed-step accumulator
+wants clamping disabled: they hand `tick` a fixed dt and never want it capped.
+The roadmap proposes `maxDt: Infinity` as the supported way to say so.
+
+The S2 constructor predicate `Number.isFinite(m) && m > 0` REJECTS `Infinity`,
+so this record's "a finite number > 0" was too tight for the API S3 ships. It is
+relaxed to:
+
+```js
+if (!(typeof m === 'number' && m > 0)) { throw ... }
+```
+
+`typeof m === 'number'` keeps the type door closed (`'5'`, `null`, `{}` still
+throw `TypeError`; the check is unchanged and lives one line up). `m > 0` still
+rejects `NaN` (`NaN > 0` is false), `0`, `-1` and every negative with a
+`RangeError`. The only value the relaxation newly admits is `Infinity`
+(`Infinity > 0` is true).
+
+The hot path is UNCHANGED. `tick`'s clamp is `if (dt > this.maxDt) dt = this.maxDt;`
+and `dt > Infinity` is never true, so with `maxDt: Infinity` the clamp is a
+documented no-op and every finite dt passes through unmodified. No branch is
+added; the constant is simply never the smaller of the two.
+
+The RangeError message drops the word "finite": it now reads
+`options.maxDt must be a number > 0`. The word was load-bearing when `Infinity`
+was rejected and would now describe a value the door accepts.
+
+Named test: `new SoaParticleEngine(4, { maxDt: Infinity })` constructs and
+`tick(1e9)` delivers dt `1e9` unclamped, while `{ maxDt: NaN | -1 | 0 }` still
+throw. This inverts the shipped node:test at
+`test/SoaParticleEngine.test.js:296`, which asserted the throw and is flipped,
+not deleted.
+
 ## References
 
 - `SoaParticleEngine_ROADMAP.md` section 2, findings P-02..P-06, P-13, P-14,
   P-17, P-18, P-19, P-20; section 5, S2 and S2.1 briefs.
+- `decisions/0003-loop-ownership.md` -- the S3 loop-ownership decisions that
+  motivate the `maxDt: Infinity` amendment above.
 - `S2_1_BRIEF.md` -- the amendment's session brief.
 - `test/bench-ceiling.mjs` -- the MAX_PARTICLES gate, C1..C7.
 - `test/bench-emit.mjs` -- the emit throughput harness and its self-test control.

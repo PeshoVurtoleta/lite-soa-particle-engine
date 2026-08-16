@@ -277,7 +277,10 @@ describe('SoaParticleEngine', () => {
     });
 
     describe('options.maxDt validation (P-02 door)', () => {
-        for (const bad of ['5', NaN, 0, -1, Infinity]) {
+        // Infinity is DELIBERATELY absent from this bad-value loop: the S3
+        // amendment to decisions/0002-the-door.md admits it (it disables the
+        // clamp for a fixed-step caller). Its acceptance is asserted below.
+        for (const bad of ['5', NaN, 0, -1]) {
             it('throws a branded error for maxDt = ' + String(bad), () => {
                 assert.throws(() => new SoaParticleEngine(4, { maxDt: bad }), (err) => {
                     assert.ok(err instanceof TypeError || err instanceof RangeError);
@@ -293,7 +296,21 @@ describe('SoaParticleEngine', () => {
             assert.throws(() => new SoaParticleEngine(4, { maxDt: NaN }), RangeError);
             assert.throws(() => new SoaParticleEngine(4, { maxDt: 0 }), RangeError);
             assert.throws(() => new SoaParticleEngine(4, { maxDt: -1 }), RangeError);
-            assert.throws(() => new SoaParticleEngine(4, { maxDt: Infinity }), RangeError);
+        });
+
+        it('ADMITS maxDt = Infinity and disables the clamp (S3 amendment to 0002, inverts the v1.0.5 throw)', () => {
+            // v1.0.5 threw a RangeError here (Number.isFinite(Infinity) is false).
+            // S3 relaxes the predicate to `typeof m === 'number' && m > 0`, which
+            // admits Infinity (Infinity > 0) and still rejects NaN/0/negatives.
+            const e = new SoaParticleEngine(4, { maxDt: Infinity });
+            assert.equal(e.maxDt, Infinity);
+            // A fixed-step caller: a large dt passes through UNCLAMPED because
+            // `dt > Infinity` is never true.
+            let seen = NaN;
+            e.onTick((d) => { seen = d; });
+            assert.equal(e.tick(1e9), true);
+            assert.equal(seen, 1e9);
+            e.destroy();
         });
 
         it('accepts a custom maxDt and stores it verbatim', () => {
@@ -665,7 +682,7 @@ describe('SoaParticleEngine', () => {
             assert.ok(/x\/y\/vx\/vy[^\n]*\[-LANE_MAX, LANE_MAX\]/.test(llms),
                 'llms.txt must document the x/y/vx/vy band [-LANE_MAX, LANE_MAX]');
             // The band is actually implemented against LANE_MAX in the source.
-            assert.ok(src.indexOf('<= LANE_MAX)) return;') !== -1,
+            assert.ok(src.indexOf('<= LANE_MAX)) return -1;') !== -1,
                 'source emit() must guard the lanes against LANE_MAX');
         });
 
@@ -722,6 +739,22 @@ describe('SoaParticleEngine', () => {
                 "source emit() must type-check a position lane with typeof (e.g. typeof vy === 'number')");
             assert.ok(src2.indexOf("typeof life === 'number'") !== -1,
                 "source emit() must type-check life with typeof (typeof life === 'number')");
+        });
+
+        it('documents tick(dt)`s rejection set (typeof + >= 0), and the source guard leads with typeof (S3 D3)', () => {
+            // tick(dt) is a NEW door: dt is a caller argument in the hot path, so
+            // the same drift guard emit() has must cover it, or the doc describes
+            // half the door. A reader must learn that a non-number OR a negative dt
+            // is rejected -- and that coercion does NOT happen (the P-23 class one
+            // entry point over). The source must lead with typeof so the P-24
+            // corpus (BigInt/Symbol/throwing valueOf) is rejected WITHOUT throwing.
+            assert.ok(/tick\(dt\)/.test(llms),
+                'llms.txt must document the tick(dt) stepping API');
+            assert.ok(/not a number/i.test(llms) && /< 0|>= 0|negative/i.test(llms),
+                'llms.txt must name BOTH tick rejection causes: not-a-number AND the low-side (< 0 / negative)');
+            // The shipped guard is typeof-FIRST, one negation, exactly emit()'s shape.
+            assert.ok(src.indexOf("!(typeof dt === 'number' && dt >= 0)") !== -1,
+                'source tick() must guard dt with the typeof-first, one-negation predicate !(typeof dt === \'number\' && dt >= 0)');
         });
     });
 
@@ -962,15 +995,13 @@ describe('SoaParticleEngine', () => {
             e.destroy();
         });
 
-        it('destroy-during-iteration (destroy() called from within onTick) does not throw and leaves the engine destroyed', () => {
-            // Adversarial case: _loop() unconditionally re-arms
-            // requestAnimationFrame AFTER invoking onTick, even when onTick just
-            // called destroy(). This does not throw and self-heals on the very
-            // next frame (the `if (!this._isRunning) return;` guard at the top of
-            // _loop fires before anything else runs), but it DOES leave one
-            // orphaned RAF callback scheduled on an already-destroyed engine --
-            // observable via pump.pending() below. Recorded as a QA finding, not
-            // fixed here (SoaParticleEngine.js is out of scope for this stage).
+        it('destroy-during-iteration (destroy() called from within onTick) leaves NO pending frame (P-26 fixed in S3, D7)', () => {
+            // Was an adversarial FINDING: _loop() used to re-arm requestAnimationFrame
+            // AFTER invoking onTick unconditionally, even when onTick just called
+            // destroy(), leaving one orphaned RAF callback on a torn-down engine.
+            // S3 D7 guards the re-arm on `_isRunning && !_destroyed`, so no orphaned
+            // frame is scheduled. This pin is flipped from pending()===true to
+            // pending()===false -- the visible, deliberate diff of the P-26 fix.
             const e = new SoaParticleEngine(4);
             let ticks = 0;
             e.onTick(() => { ticks++; e.destroy(); });
@@ -979,8 +1010,9 @@ describe('SoaParticleEngine', () => {
             assert.equal(e._destroyed, true);
             assert.equal(e._isRunning, false);
             assert.equal(ticks, 1);
-            // Firing the orphaned frame is harmless: the top-of-_loop guard
-            // returns immediately and does not re-invoke onTick or re-arm again.
+            // The re-arm is guarded: after destroy() from inside onTick, no frame
+            // is pending. A second pump has nothing to fire and re-invokes nothing.
+            assert.equal(pump.pending(), false);
             assert.doesNotThrow(() => pump.pump(32));
             assert.equal(ticks, 1);
             assert.equal(pump.pending(), false);

@@ -15,7 +15,7 @@
  * for maximum rendering flexibility.
  */
 
-export const VERSION = '1.0.5';
+export const VERSION = '1.1.0';
 
 /**
  * Upper bound on maxParticles, a policy number (not a probe of what happens to
@@ -92,8 +92,9 @@ function _showArg(v) {
  * The door contract (decisions/0002-the-door.md):
  *   - The constructor THROWS a named library error (TypeError / RangeError, no
  *     subclass) for any maxParticles that is not an integer in [1, MAX_PARTICLES],
- *     and for any options.maxDt that is not a finite number > 0. It validates
- *     before allocating, so the bare "Invalid typed array length" never escapes.
+ *     and for any options.maxDt that is not a number > 0 (Infinity IS admitted,
+ *     to disable clamping for a fixed-step caller -- S3 amendment to 0002). It
+ *     validates before allocating, so "Invalid typed array length" never escapes.
  *   - emit() NEVER throws (it is per-frame, per-particle; a throw is a render-loop
  *     crash). It silently rejects, before touching any lane, any emit whose
  *     x/y/vx/vy fall outside the symmetric f32 band [-LANE_MAX, LANE_MAX]
@@ -104,7 +105,8 @@ function _showArg(v) {
  *   - A frame gap larger than maxDt is CLAMPED to maxDt: a clamped frame LOSES
  *     time by design (the alternative is particles tunnelling). This engine is
  *     therefore NOT a fixed-step simulator. A caller needing a fixed-step
- *     accumulator drives tick(dt) themselves (lands in S3).
+ *     accumulator drives tick(dt) themselves and sets maxDt: Infinity to
+ *     disable the clamp (S3).
  *   - clear() is life-only: for a dead slot (life[i] <= 0) the values in
  *     x/y/vx/vy/invLife/data are UNDEFINED. No correct consumer reads them.
  *   - The seven lanes are reassigned (to null) ONLY by destroy(), never by any
@@ -118,7 +120,8 @@ export class SoaParticleEngine {
      * @param {{ maxDt?: number }} [options] Optional configuration. `maxDt`
      *   (default 0.1) is the largest frame delta the loop will pass to onTick; a
      *   larger gap is clamped to it and the excess time is dropped by design. Must
-     *   be a finite number > 0 or the constructor throws.
+     *   be a number > 0 or the constructor throws; Infinity is admitted and
+     *   disables the clamp (for a fixed-step caller driving tick(dt) directly).
      */
     constructor(maxParticles = 1000, options) {
         // COLD path: validate before allocating so the allocator's bare
@@ -145,9 +148,14 @@ export class SoaParticleEngine {
                     'SoaParticleEngine: options.maxDt must be a number, got ' +
                     typeof m + ' ' + _showArg(m));
             }
-            if (!(Number.isFinite(m) && m > 0)) {
+            // typeof m === 'number' already established above. `m > 0` rejects
+            // NaN (NaN > 0 is false), 0 and every negative, and ADMITS Infinity
+            // (S3 amendment to decisions/0002-the-door.md): a fixed-step caller
+            // sets maxDt: Infinity to disable clamping, and `dt > Infinity` is
+            // never true, so the tick() clamp becomes a documented no-op.
+            if (!(m > 0)) {
                 throw new RangeError(
-                    'SoaParticleEngine: options.maxDt must be a finite number > 0, got ' + m);
+                    'SoaParticleEngine: options.maxDt must be a number > 0, got ' + m);
             }
             maxDt = m;
         }
@@ -202,9 +210,13 @@ export class SoaParticleEngine {
      *   BigInt, Symbol, or object with a throwing valueOf / Symbol.toPrimitive is
      *   also rejected WITHOUT throwing, because the guard leads with typeof (P-24).
      *   0 is the default and a legal id.
+     * @returns {number} The slot index written, in [0, max), on success; -1 on
+     *   every rejection path (any lane out of band, a non-int32 dataFlag, or a
+     *   destroyed engine). The index is a RECEIPT, not an identity (D4): it is
+     *   valid until that slot is reused, and after S4 until the next compaction.
      */
     emit(x, y, vx, vy, life, dataFlag = 0) {
-        if (this._destroyed) return;
+        if (this._destroyed) return -1;
 
         // x/y/vx/vy share the symmetric f32 lane band [-LANE_MAX, LANE_MAX]. Each
         // guard has TWO non-optional halves inside ONE negation: the range half
@@ -216,14 +228,14 @@ export class SoaParticleEngine {
         // close. typeof is a call-free V8 type check, cheaper than Number.isFinite
         // and not a builtin call. The band has NO floor: 0, -0, negatives and
         // subnormals are all legal coordinates.
-        if (!(typeof x  === 'number' && x  >= -LANE_MAX && x  <= LANE_MAX)) return;
-        if (!(typeof y  === 'number' && y  >= -LANE_MAX && y  <= LANE_MAX)) return;
-        if (!(typeof vx === 'number' && vx >= -LANE_MAX && vx <= LANE_MAX)) return;
-        if (!(typeof vy === 'number' && vy >= -LANE_MAX && vy <= LANE_MAX)) return;
+        if (!(typeof x  === 'number' && x  >= -LANE_MAX && x  <= LANE_MAX)) return -1;
+        if (!(typeof y  === 'number' && y  >= -LANE_MAX && y  <= LANE_MAX)) return -1;
+        if (!(typeof vx === 'number' && vx >= -LANE_MAX && vx <= LANE_MAX)) return -1;
+        if (!(typeof vy === 'number' && vy >= -LANE_MAX && vy <= LANE_MAX)) return -1;
         // The life band, same two-half predicate: the range half also rejects NaN,
         // both infinities, 0 and negatives; the typeof half rejects coerced
         // non-numbers ("1", true, [1]) that v1.0.4 laundered into life (P-23).
-        if (!(typeof life === 'number' && life >= LIFE_MIN && life <= LIFE_MAX)) return;
+        if (!(typeof life === 'number' && life >= LIFE_MIN && life <= LIFE_MAX)) return -1;
         // dataFlag, same typeof-first predicate (P-24). `|` invokes ToNumeric,
         // which THROWS for BigInt/Symbol and RUNS caller code (valueOf,
         // Symbol.toPrimitive) for objects -- so `(dataFlag | 0)` on an unvalidated
@@ -231,7 +243,7 @@ export class SoaParticleEngine {
         // never calls user code and never throws, so `|` is reached only once
         // dataFlag is known to be a primitive number. (d | 0) === d is then the
         // exact-int32 test: it rejects fractions and out-of-int32-range values.
-        if (!(typeof dataFlag === 'number' && (dataFlag | 0) === dataFlag)) return;
+        if (!(typeof dataFlag === 'number' && (dataFlag | 0) === dataFlag)) return -1;
 
         const i = this._head;
 
@@ -244,23 +256,95 @@ export class SoaParticleEngine {
         this.data[i]    = dataFlag;
 
         this._head = (i + 1) % this.max;
+
+        // Receipt, not identity (D4): the slot just written. Valid until that
+        // slot is reused (and after S4 until the next compaction). -1 is the one
+        // rejection value, returned on every early-return above.
+        return i;
     }
 
     /**
-     * Register the tick callback. Called every frame with raw arrays.
+     * Register the tick callback. Called every frame (or every tick()) with raw
+     * arrays. COLD path: called once at setup, so it throws at the door (D6),
+     * unlike the per-frame emit()/tick() which silently reject.
      *
-     * @param {Function} callback (dt, x, y, vx, vy, life, invLife, data, max)
-     *   dt: seconds since last frame
-     *   x..data: the raw TypedArrays -- mutate them directly
-     *   max: array length
+     * @param {Function|null|undefined} callback (dt, x, y, vx, vy, life, invLife,
+     *   data, max) -- a function registers; null or undefined UNREGISTER and
+     *   return normally. Anything else throws a named TypeError (P-27): a
+     *   non-callable stored here would crash the frame path the next time the
+     *   loop invokes it, the exact failure emit()'s never-throws contract exists
+     *   to prevent. `null` is stored (never `undefined`) so tick()/_loop test
+     *   `=== null` rather than truthiness -- truthiness is what let `42` through.
+     *   dt: seconds since last frame; x..data: the raw TypedArrays -- mutate them
+     *   directly; max: array length.
      */
     onTick(callback) {
+        if (callback === null || callback === undefined) {
+            this._onTick = null;
+            return;
+        }
+        if (typeof callback !== 'function') {
+            throw new TypeError(
+                'SoaParticleEngine: onTick(callback) requires a function, null or ' +
+                'undefined, got ' + typeof callback + ' ' + _showArg(callback));
+        }
         this._onTick = callback;
     }
 
-    /** Start the RAF loop. */
+    /**
+     * Advance the simulation by `dt` seconds, invoking the registered callback
+     * once. This is the PRIMARY stepping API (S3): a host game loop, a fixed-step
+     * accumulator, lite-scheduler or a worker calls tick(dt) directly, with no
+     * DOM required. start()/stop() are thin RAF wrappers that call it.
+     *
+     * HOT path. Never throws (like emit(), it runs per frame; a throw is a
+     * render-loop crash). Type before value, one negation: the `dt >= 0` half
+     * rejects NaN for free -- exactly as the lane bands do -- and the typeof half
+     * rejects coerced non-numbers ('0.05', null, [7], true) and the throwing
+     * P-24 corpus (BigInt/Symbol/hostile valueOf) that a bare relational operator
+     * on `dt` would launder or throw on. -0 passes and is harmless.
+     *
+     * dt is CLAMPED to maxDt on the high side (the shipped S2 contract; a clamped
+     * frame loses time by design) but REJECTED, never clamped, on the low side:
+     * clamping -1 to 0 would silently change what the caller asked for.
+     *
+     * @param {number} dt Seconds to advance. Must be a number >= 0; anything else
+     *   (negative, NaN, non-number) is silently rejected.
+     * @returns {boolean} true iff the callback ran; false on a rejected dt, no
+     *   registered callback, or a destroyed engine.
+     */
+    tick(dt) {
+        if (this._destroyed) return false;
+        if (!(typeof dt === 'number' && dt >= 0)) return false;
+        if (dt > this.maxDt) dt = this.maxDt;
+        if (this._onTick === null) return false;
+        this._onTick(
+            dt,
+            this.x, this.y, this.vx, this.vy,
+            this.life, this.invLife, this.data,
+            this.max
+        );
+        return true;
+    }
+
+    /**
+     * Start the RAF loop. COLD path. Validates the environment BEFORE mutating
+     * any state (D2): with no `requestAnimationFrame` global it throws a named
+     * library error and leaves _isRunning and _lastTime UNTOUCHED, so a caller
+     * who installs a polyfill and retries gets a working engine. Detection is
+     * `typeof requestAnimationFrame !== 'function'` -- typeof on an undeclared
+     * identifier does not throw, which is why it is the test and not a
+     * try/catch around the call. P-28: today that retry is a silent no-op
+     * forever, because start() set _isRunning = true before the ReferenceError.
+     */
     start() {
         if (this._isRunning || this._destroyed) return;
+        if (typeof requestAnimationFrame !== 'function') {
+            throw new TypeError(
+                'SoaParticleEngine: start() requires requestAnimationFrame; none ' +
+                'is defined in this environment. Drive tick(dt) directly instead, ' +
+                'or install a requestAnimationFrame polyfill before calling start().');
+        }
         this._isRunning = true;
         this._lastTime = performance.now();
         this._rafId = requestAnimationFrame(this._loop);
@@ -310,29 +394,35 @@ export class SoaParticleEngine {
         this._onTick = null;
     }
 
-    /** @private */
+    /**
+     * @private
+     * The RAF driver: read the clock, compute dt, delegate the clamp + callback
+     * to tick(). It does NOT clamp or invoke the callback itself -- maxDt lives
+     * in exactly one place (tick), and this method lives in zero of them.
+     */
     _loop(time) {
-        if (!this._isRunning) return;
+        if (!this._isRunning || this._destroyed) return;
 
-        let dt = (time - this._lastTime) / 1000;
-        this._lastTime = time;
-
-        // Clamp dt on lag spikes / tab switches. A clamped frame LOSES the excess
-        // time by design (the alternative is a physics step so large particles
-        // tunnel). Negative and NaN dt are deliberately untouched -- a broken
-        // clock is the caller's problem, out of scope for this engine.
-        if (dt > this.maxDt) dt = this.maxDt;
-
-        if (this._onTick) {
-            this._onTick(
-                dt,
-                this.x, this.y, this.vx, this.vy,
-                this.life, this.invLife, this.data,
-                this.max
-            );
+        // The clock is environment input, not the engine's (D8). `time >=
+        // _lastTime` rejects NaN and a backwards clock in one comparison, and it
+        // guarantees dt >= 0, so tick()'s own low-side guard can never reject a
+        // value _loop produced -- the two guards compose instead of duplicating.
+        // Crucially _lastTime is NOT advanced on a bad reading: a transient bad
+        // sample self-heals on the next good one, instead of poisoning _lastTime
+        // to NaN and killing the engine silently and permanently (P-28's shape
+        // through the clock door).
+        if (typeof time === 'number' && time >= this._lastTime) {
+            const dt = (time - this._lastTime) / 1000;
+            this._lastTime = time;
+            this.tick(dt);
         }
 
-        this._rafId = requestAnimationFrame(this._loop);
+        // Re-arm only while still running and not destroyed (D7, P-26): a
+        // callback that called destroy()/stop() must not leave an orphaned frame
+        // pending on a torn-down engine.
+        if (this._isRunning && !this._destroyed) {
+            this._rafId = requestAnimationFrame(this._loop);
+        }
     }
 }
 
