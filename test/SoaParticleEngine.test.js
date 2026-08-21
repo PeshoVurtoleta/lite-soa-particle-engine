@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SoaParticleEngine, MAX_PARTICLES, LIFE_MIN, LIFE_MAX, LANE_MAX } from '../SoaParticleEngine.js';
+import { Random } from '@zakkster/lite-random';
 import { installFramePump } from './helpers/env.mjs';
 
 describe('SoaParticleEngine', () => {
@@ -756,6 +757,26 @@ describe('SoaParticleEngine', () => {
             assert.ok(src.indexOf("!(typeof dt === 'number' && dt >= 0)") !== -1,
                 'source tick() must guard dt with the typeof-first, one-negation predicate !(typeof dt === \'number\' && dt >= 0)');
         });
+
+        it('documents emitBurst`s draw law, its ORDER, and the one propagating throw (S3.1 D2/D4)', () => {
+            // emitBurst is a NEW hot door. A reader must learn (a) that every
+            // particle draws exactly 3 rng values, (b) the order angle/speed/life,
+            // and (c) that the sole throw is a caller rng.next() propagating -- or
+            // the doc describes a surface the guard chain does not match (P-20).
+            assert.ok(/emitBurst/.test(llms),
+                'llms.txt must document emitBurst');
+            assert.ok(/3 rng\.next\(\)|EXACTLY 3|exactly 3/.test(llms),
+                'llms.txt must state the 3-draws-per-particle law');
+            assert.ok(/angle, speed, life/.test(llms),
+                'llms.txt must name the draw ORDER angle, speed, life');
+            assert.ok(/PROPAGATES|propagates/.test(llms) && /rng\.next\(\)/.test(llms),
+                'llms.txt must state that a caller rng.next() throw propagates');
+            assert.ok(/exactly `count`|EXACTLY `count`|exactly count/.test(llms),
+                'llms.txt must state the return collapses to -1 or exactly count');
+            // The shipped guard is destroyed-first, matching emit()/tick().
+            assert.ok(/emitBurst\(x, y, count, spec, rng\) \{\n\s*if \(this\._destroyed\) return -1;/.test(src),
+                'source emitBurst() must guard _destroyed as its first line (R11)');
+        });
     });
 
     describe('alpha tolerance at birth', () => {
@@ -1018,4 +1039,159 @@ describe('SoaParticleEngine', () => {
             assert.equal(pump.pending(), false);
         });
     });
+
+    describe('emitBurst() boundary cases (S3.1, decisions/0004)', () => {
+        // A counting rng: records every draw, always returns 0.5 (a valid [0,1)).
+        function counting() {
+            const st = { draws: 0 };
+            return { next() { st.draws++; return 0.5; }, st };
+        }
+
+        it('an accepted burst returns exactly count, writes count slots, advances head by count', () => {
+            const e = new SoaParticleEngine(64);
+            const c = counting();
+            const ret = e.emitBurst(0, 0, 3, {}, c);
+            assert.equal(ret, 3);
+            assert.equal(c.st.draws, 9); // 3 draws per particle
+            assert.equal(e._head, 3);
+            e.destroy();
+        });
+
+        it('draws in the order angle, speed, life (a sequencing rng identifies each field)', () => {
+            const KNOWN = [0.25, 0.75, 0.9];
+            let i = 0;
+            const seq = { next() { return KNOWN[i++ % 3]; } };
+            const e = new SoaParticleEngine(4);
+            e.emitBurst(10, 20, 1, { speed: 100, speedVar: 0, angle: 0, angleVar: Math.PI, life: 2, lifeVar: 1 }, seq);
+            // a = 0 + (0.25*2-1)*PI = -0.5*PI ; s = 100 ; l = 2 + (0.9*2-1)*1 = 2.8
+            const a = -0.5 * Math.PI;
+            assert.equal(e.vx[0], Math.fround(Math.cos(a) * 100));
+            assert.equal(e.vy[0], Math.fround(Math.sin(a) * 100));
+            assert.equal(e.life[0], Math.fround(2.8));
+            e.destroy();
+        });
+
+        it('every bad count returns -1, draws nothing, leaves head at 0, and never throws', () => {
+            const e = new SoaParticleEngine(4);
+            const c = counting();
+            const bad = [NaN, -1, 0, 2.5, '3', true, [3], null, undefined, Infinity, 10n, Symbol('s')];
+            for (const cnt of bad) {
+                let threw = null, ret = 0;
+                try { ret = e.emitBurst(0, 0, cnt, {}, c); } catch (err) { threw = err; }
+                assert.equal(threw, null, 'emitBurst count=' + String(cnt) + ' must not throw');
+                assert.equal(ret, -1, 'emitBurst count=' + String(cnt) + ' must return -1');
+            }
+            assert.equal(c.st.draws, 0);
+            assert.equal(e._head, 0);
+            e.destroy();
+        });
+
+        it('every bad rng returns -1, draws nothing, and a bare function is rejected (D1)', () => {
+            const e = new SoaParticleEngine(4);
+            const bad = [null, 42, {}, { next: 42 }, Math.random];
+            for (const rng of bad) {
+                let threw = null, ret = 0;
+                try { ret = e.emitBurst(0, 0, 3, {}, rng); } catch (err) { threw = err; }
+                assert.equal(threw, null);
+                assert.equal(ret, -1, 'emitBurst rng must return -1');
+            }
+            assert.equal(e._head, 0);
+            e.destroy();
+        });
+
+        it('an undefined rng resolves to the default singleton and stores count (D1)', () => {
+            const e = new SoaParticleEngine(8);
+            const ret = e.emitBurst(0, 0, 2);
+            assert.equal(ret, 2);
+            assert.equal(e._head, 2);
+            e.destroy();
+        });
+
+        it('an envelope violation returns -1, draws nothing, leaves lanes byte-identical (R4)', () => {
+            const e = new SoaParticleEngine(4);
+            const c = counting();
+            const before = e.x[0];
+            // life 0: life +/- lifeVar = 0, below LIFE_MIN -> whole burst rejected.
+            assert.equal(e.emitBurst(0, 0, 5, { life: 0 }, c), -1);
+            // speed past the lane band.
+            assert.equal(e.emitBurst(0, 0, 5, { speed: LANE_MAX, speedVar: LANE_MAX }, c), -1);
+            assert.equal(c.st.draws, 0);
+            assert.equal(e._head, 0);
+            assert.equal(e.x[0], before);
+            e.destroy();
+        });
+
+        it('a hostile spec field (Symbol/BigInt) is rejected without throwing (D4)', () => {
+            const e = new SoaParticleEngine(4);
+            for (const speed of [Symbol('x'), 10n, 'fast', {}]) {
+                let threw = null, ret = 0;
+                try { ret = e.emitBurst(0, 0, 3, { speed }, { next: () => 0.5 }); } catch (err) { threw = err; }
+                assert.equal(threw, null);
+                assert.equal(ret, -1);
+            }
+            e.destroy();
+        });
+
+        it('a spec whose fields are getters fires each getter exactly once per burst (D3)', () => {
+            let calls = 0;
+            const spec = { get speed() { calls++; if (calls > 1) throw new Error('read twice'); return 100; } };
+            const e = new SoaParticleEngine(128);
+            let threw = null;
+            try { e.emitBurst(0, 0, 100, spec, new Random(7)); } catch (err) { threw = err; }
+            assert.equal(threw, null);
+            assert.equal(calls, 1);
+            assert.equal(e._head, 100);
+            e.destroy();
+        });
+
+        it('a caller rng.next() throw PROPAGATES; particles stored before it remain (D4)', () => {
+            let n = 0;
+            const thr = { next() { n++; if (n > 6) throw new Error('boom'); return 0.5; } };
+            const e = new SoaParticleEngine(8);
+            assert.throws(() => e.emitBurst(0, 0, 5, {}, thr), /boom/);
+            assert.equal(e._head, 2); // 2 particles fully stored (6 draws) before the 7th draw threw
+            e.destroy();
+        });
+
+        it('emitBurst after destroy() returns -1 and consumes no draws (R11)', () => {
+            const e = new SoaParticleEngine(4);
+            const c = counting();
+            e.destroy();
+            assert.equal(e.emitBurst(0, 0, 3, {}, c), -1);
+            assert.equal(c.st.draws, 0);
+        });
+
+        it('two fresh engines + two Random(seed) are byte-identical; sharing one Random diverges (D6)', () => {
+            const spec = { speed: 150, speedVar: 40, angle: 0.3, angleVar: 1.2, life: 2, lifeVar: 0.5, data: 7 };
+            const a = new SoaParticleEngine(64), b = new SoaParticleEngine(64);
+            a.emitBurst(1, 2, 30, spec, new Random(12345));
+            b.emitBurst(1, 2, 30, spec, new Random(12345));
+            let identical = true;
+            for (let s2 = 0; s2 < 64; s2++) {
+                if (a.x[s2] !== b.x[s2] || a.vx[s2] !== b.vx[s2] || a.vy[s2] !== b.vy[s2] ||
+                    a.life[s2] !== b.life[s2] || a.data[s2] !== b.data[s2]) identical = false;
+            }
+            assert.ok(identical, 'two Random(12345) instances must replay byte-identically');
+
+            const shared = new Random(12345);
+            const c = new SoaParticleEngine(64), d = new SoaParticleEngine(64);
+            c.emitBurst(1, 2, 30, spec, shared);
+            d.emitBurst(1, 2, 30, spec, shared); // consumes the CONTINUATION of the stream
+            let differs = false;
+            for (let s2 = 0; s2 < 64; s2++) {
+                if (c.vx[s2] !== d.vx[s2] || c.vy[s2] !== d.vy[s2]) differs = true;
+            }
+            assert.ok(differs, 'two engines sharing one Random must diverge on at least one lane');
+            a.destroy(); b.destroy(); c.destroy(); d.destroy();
+        });
+
+        it('a burst into a full ring still stores count and burns 3*count draws (D2)', () => {
+            const e = new SoaParticleEngine(1);
+            const c = counting();
+            assert.equal(e.emitBurst(0, 0, 1000, {}, c), 1000);
+            assert.equal(c.st.draws, 3000);
+            e.destroy();
+        });
+    });
+
 });

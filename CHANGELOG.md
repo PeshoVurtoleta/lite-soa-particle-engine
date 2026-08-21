@@ -3,6 +3,136 @@
 All notable changes to `@zakkster/lite-soa-particle-engine` are documented here.
 The format follows Keep a Changelog; this project uses semantic versioning.
 
+## [1.2.0] - 2026-08-21
+
+The spawn path. S3 gave the frame back to the application (`tick(dt)`); it did
+NOT give back the SPAWN -- every recipe still reached for the platform PRNG
+inside the caller's own loop, so two runs of the same script diverged on the
+first particle and nothing could be replayed. This release adds ONE hot method,
+`emitBurst(x, y, count, spec, rng)`, whose entire reason to exist is that the
+randomness is an argument. It writes down, for the first time, what
+"deterministic" is allowed to mean for this package -- which is narrower than
+anyone had assumed, because `clear()` does not reset a replay. The policy is
+recorded in `decisions/0004-the-spawn-path.md`, with the `count`/`spec`/`rng`
+door widening recorded as an amendment to `decisions/0002-the-door.md`. This is
+a MINOR release: additive, non-breaking. No throughput or performance number is
+claimed in any file; S6 owns every stamped bench.
+
+### Added
+- **`emitBurst(x, y, count, spec, rng)` -- the injectable-RNG spawn path (P-09,
+  the spawn half).** Emits a cone of `count` particles from `(x, y)` through the
+  existing guarded `emit()` store. `spec` is
+  `{ speed=100, speedVar=0, angle=0, angleVar=Math.PI, life=1, lifeVar=0,
+  data=0 }`, every field optional. `rng` is any object with a single `.next()`
+  -> `[0, 1)` method (lite-random's `Random` satisfies it directly; a bare
+  function is rejected, decision D1); it defaults to a frozen module singleton
+  reading the platform PRNG -- the one permitted such site in the file.
+  - **Draw law (D2, NORMATIVE).** Every particle in an accepted burst draws
+    EXACTLY 3 rng values, in the ORDER `angle, speed, life`, unconditionally --
+    not conditionally on the matching `*Var`, not on the individual store being
+    accepted. The stream is therefore independent of ring occupancy, so a
+    seeded replay survives a full pool. Per particle:
+    `a = angle + (d1*2-1)*angleVar`, `s = speed + (d2*2-1)*speedVar`,
+    `l = life + (d3*2-1)*lifeVar`, then `store(x, y, cos(a)*s, sin(a)*s, l, data)`.
+  - **Never throws for a bad-VALUE argument (D4).** `x`, `y`, `count` and every
+    `spec` field pass `emit()`'s typeof-first door ONCE per burst. typeof-first
+    defends against COERCION: a hostile `spec` field that is a `Symbol`, a
+    `BigInt`, or an object with a throwing `valueOf` / `Symbol.toPrimitive` is
+    rejected with `-1` before any operator invokes its coercion. It cannot
+    precede a property READ, so caller CODE propagates -- see "Documented throw
+    paths" below. `count === 0`
+    is a door rejection returning `-1` (R5): an accepted zero-count burst would
+    consume 0 draws, and a draw count that depends on an argument's value is the
+    state-dependent stream D2 exists to forbid.
+  - **The envelope collapses the return type (R4).** A once-per-burst envelope
+    check -- `angle`/`angleVar` in `[-LANE_MAX, LANE_MAX]`,
+    `|speed| + |speedVar| <= LANE_MAX`, `life +/- lifeVar` in
+    `[LIFE_MIN, LIFE_MAX]` -- guarantees every per-particle store succeeds. So
+    `emitBurst` returns `-1` on a door rejection (nothing drawn, nothing
+    written) or EXACTLY `count` on an accepted burst. There is no `0..count`
+    partial-burst range; a full ring stomps (P-01) but still stores.
+  - **Documented throw paths -- all caller CODE, all propagating.** Three, not
+    one: a `rng.next()` that throws, a throwing accessor getter on a `spec`
+    field, and a throwing accessor getter on `rng.next`. An accessor getter runs
+    when the property is READ, and the read supplies the value the guard is about
+    to check, so no guard can precede it -- typeof-first orders the check before
+    coercion, but a read has no earlier position to occupy. A throwing `valueOf`
+    is NOT among them: it is a coercion path, rejected with `-1`. Swallowing any
+    caller throw would convert a caller bug into a silently half-written burst.
+    Particles stored before the throw remain, and the write cursor has advanced
+    by exactly that many.
+- **A bounded replay claim (D6), written in README, llms.txt and
+  `decisions/0004`.** Given a FRESH engine, an identical emit/tick script, and
+  an RNG replaying the same seed, every lane is byte-identical across runs and
+  across machines -- with three bounds shipped in the same paragraph, never a
+  footnote (see P-30).
+- **Two devDependencies:** `@zakkster/lite-random@^1.1.0` (seed parity) and
+  `@zakkster/lite-scheduler@^1.0.1` (a tick source), both proven to install and
+  exercised by the T8 torture tier. `dependencies` remains ABSENT: the
+  zero-runtime-dependency law is absolute.
+
+### Fixed
+- **P-31 (S2) -- the README forbade numeric performance claims and then made
+  one, seven lines later, and a second, older copy shipped in the source
+  header.** `README.md:21-22` states a stamped benchmark lands in S6 and that
+  the file "makes no numeric performance claim"; `README.md:28` then asserted,
+  in bold, "10x fewer cache misses for tight physics loops", and the
+  `SoaParticleEngine.js` header carried "iterating a Float32Array is ~10x
+  faster" -- both shipped in `files[]`, neither with a machine, a counter or a
+  repro. Repro:
+  `grep -nE "[0-9]+x |[0-9]+%" SoaParticleEngine.js README.md llms.txt
+  SoaParticleEngine.d.ts` returned two lines. BOTH numbers are deleted and both
+  mechanisms kept (sequential lanes let the prefetcher work; object graphs do
+  not); the grep now returns zero hits (decision D7 / R1).
+
+### Documented (not repaired)
+- **P-30 (S3) -- `clear()` is not a replay reset, and the replay contract this
+  release writes would be false without saying so.** Two FRESH engines on the
+  same script are byte-identical, but `clear()` zeroes `life` and the cursor
+  only (P-13), so an engine that is cleared and then replayed with a SHORTER
+  script keeps the previous scene's `x/y/vx/vy/data` in every slot the replay
+  does not reach. Repro: 8 emits at `x=500..507, data=42`, `clear()`, then a
+  2-emit replay -> `x[7] === 507` and `data[7] === 42` where a fresh engine
+  reads `0` and `0`; an ungated `sum(x[i])` reads `3028` vs the fresh engine's
+  `1`. This ships as a BOUND on the replay claim -- clear() is not a replay
+  reset; parity comes from seed parity, not from sharing one `Random`; f32
+  storage is the equality domain. It is NOT repaired here: zeroing seven lanes
+  instead of one is a hot-path cost decision that rides with S4's liveness work.
+
+### Known issues (recorded, not repaired)
+- **P-32 (S2, open) -- the collapse law is stated unconditionally and is
+  falsifiable two ways, neither of which throws.** Found by S3.1 qa AFTER the
+  reviewer approved, by attacking the one claim this release rests on. The
+  once-per-burst envelope is meant to guarantee that an accepted burst stores
+  EXACTLY `count`, and six sites in this release say so with no qualifier.
+  **(a) Caller code mutating the engine mid-burst.** `_destroyed` is read ONCE,
+  at the top of `emitBurst`, so an `rng.next()` that calls `destroy()` part way
+  through leaves every remaining per-particle `emit()` returning `-1` and the
+  burst reports a short count. Repro: `const e = new SoaParticleEngine(8);
+  let k = 0; e.emitBurst(0, 0, 5, {}, { next() { if (++k === 4) e.destroy();
+  return 0.5; } })` -> returns **1**, not 5, and does not throw. Note the rng
+  honours its `.next() -> [0, 1)` contract exactly, so the return-contract
+  scope clause this release added to the THROW enumeration does not cover it.
+  **(b) An rng returning a number outside [0, 1).** The envelope's proof
+  assumes the multiplier `(d * 2 - 1)` lies in `[-1, 1)`; a `next()` returning
+  `2` makes it `3`, so `s = speed + 3 * speedVar` escapes `LANE_MAX` and every
+  store is rejected. Repro with `spec = { speed: 1e38, speedVar: 2e38 }` (sum
+  `3e38 <= LANE_MAX`, so the envelope accepts) and `count = 4`: `next()=0.5`
+  -> 4; `next()=1.0` -> 4; `next()=2` -> **0**; `next()=-1` -> **0**;
+  `next()=NaN` -> **0**. Reachable without anyone writing a bad number on
+  purpose: a `next()` returning a plain object coerces to `NaN` at the
+  `next() * 2` site.
+
+  **Not a regression** -- `emitBurst` is new in this release. The BEHAVIOUR is
+  defensible in both cases: the return is an honest count of what was stored,
+  and neither swallowing caller code nor validating `next()`'s return on every
+  draw is a decision this session took. What is wrong is the unconditional
+  WORDING. Deliberately not repaired here, for the same reason 1.1.0 recorded
+  P-29 rather than patching it after review: scoping a shipped claim is a
+  decision, and taking one post-approval is the mid-flight scope widening the
+  S2 -> S2.1 split exists to prevent. Pinned as current behaviour in
+  `test/qa-s31.test.js`. Scheduled with S4, beside P-29.
+
 ## [1.1.0] - 2026-08-16
 
 Loop ownership. The engine owned `requestAnimationFrame` and did not own the

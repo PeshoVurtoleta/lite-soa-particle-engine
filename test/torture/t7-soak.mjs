@@ -28,6 +28,9 @@ const MAX = 64;
 const N = 32;           // particles emitted per cycle
 const KILL_DT = 2.0;    // one aging pass this large expires every particle
 const NOOP = function () {};
+// Hoisted ONCE: a per-cycle object literal would churn over 4096 cycles. Life is
+// well under KILL_DT so the burst particles expire on the same drain as the emits.
+const BURST_SPEC = { speed: 120, speedVar: 40, angle: 0, angleVar: Math.PI, life: 0.5, lifeVar: 0.1, data: 5 };
 
 export function run() {
     const engine = new SoaParticleEngine(MAX);
@@ -42,6 +45,10 @@ export function run() {
         for (let i = 0; i < N; i++) {
             engine.emit(i, i, 1, -1, 0.5 + (i & 3) * 0.1, i);
         }
+        // A burst per cycle (S3.1), DEFAULT_RNG, into the same ring. Exercises the
+        // spawn path under the soak so a burst-side lane or object leak shows in
+        // the arrayBuffers delta and the lite-leak tracker alongside emit().
+        engine.emitBurst(0, 0, 8, BURST_SPEC);
         // A tracked external resource modelling a per-cycle allocation. The tag
         // is a number and the cleanup is module-level -- neither captures target.
         const h = tracker.track({ cycle: c }, NOOP, c);

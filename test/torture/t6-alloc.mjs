@@ -20,6 +20,7 @@ import { SoaParticleEngine } from '../../SoaParticleEngine.js';
 import {
     runOpsGate, BREAK, check, die, snapshotLaneBytes, checkLaneBytes,
 } from './harness.mjs';
+import { Random } from '@zakkster/lite-random';
 
 const N = 256;             // ring size (power of two)
 const OPS = 60000;         // hot iterations -> the ring wraps ~234 times
@@ -67,35 +68,55 @@ export function run() {
     };
     engine.onTick(aged);
 
-    const hot = (i) => {
+    // The burst spec is hoisted ONCE, outside every loop -- a per-op object literal
+    // would allocate and fail this very gate. The injected Random is allocated once
+    // too; its .next() (mulberry32) allocates nothing. emitBurst's cone (3 draws,
+    // cos, sin, store) is the new hot entry point under test.
+    const BURST = 4;
+    const burstSpec = { speed: 200, speedVar: 50, angle: 0, angleVar: Math.PI, life: 0.5, lifeVar: 0.1, data: 3 };
+    const injected = new Random(0x51ed);
+
+    // Config A -- emitBurst with an INJECTED Random. Config B -- emitBurst with the
+    // DEFAULT_RNG (rng omitted). Both include emit + tick so the whole hot surface
+    // is inside one measured window. The BREAK control retains an allocation so the
+    // whole-suite SOA_TORTURE_BREAK exit-non-zero contract still trips here.
+    const hotInjected = (i) => {
         const idx = i & (N - 1);
-        // One emit per op: safe finite values, life above the P-05 floor.
         engine.emit(px[idx], py[idx], pvx[idx], pvy[idx], 0.5 + (idx & 7) * 0.1, idx & 15);
-
-        // Advance the simulation through the public hot-path stepping API.
+        engine.emitBurst(px[idx], py[idx], BURST, burstSpec, injected);
         engine.tick(DT);
-
         if (BREAK) leak.push(new Float64Array(64)); // control: retained growth
+    };
+    const hotDefault = (i) => {
+        const idx = i & (N - 1);
+        engine.emit(px[idx], py[idx], pvx[idx], pvy[idx], 0.5 + (idx & 7) * 0.1, idx & 15);
+        engine.emitBurst(px[idx], py[idx], BURST, burstSpec); // DEFAULT_RNG
+        engine.tick(DT);
+        if (BREAK) leak.push(new Float64Array(64));
     };
 
     const before = new Float64Array(7);
-    snapshotLaneBytes(engine, before);
 
-    const { report, summary } = runOpsGate(hot, { ops: OPS, warmup: WARMUP });
+    const configs = [['injected Random', hotInjected], ['DEFAULT_RNG', hotDefault]];
+    for (let c = 0; c < configs.length; c++) {
+        const label = configs[c][0], hot = configs[c][1];
+        snapshotLaneBytes(engine, before);
+        const { report, summary } = runOpsGate(hot, { ops: OPS, warmup: WARMUP });
 
-    // The structural assertion no heap gate can make: every lane's backing store
-    // must be byte-identical in size after the window.
-    checkLaneBytes(engine, before, 'T6');
+        // The structural assertion no heap gate can make: every lane's backing
+        // store must be byte-identical in size after the window.
+        checkLaneBytes(engine, before, 'T6 (' + label + ')');
 
-    if (!report.ok) {
-        const g = summary.gc;
-        die('T6 alloc gate rejected -- verdict=' + report.verdict +
-            ' source=' + summary.source +
-            ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
-            (BREAK ? ' (SOA_TORTURE_BREAK control -- expected)' : ''));
+        if (!report.ok) {
+            const g = summary.gc;
+            die('T6 alloc gate rejected (' + label + ') -- verdict=' + report.verdict +
+                ' source=' + summary.source +
+                ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
+                (BREAK ? ' (SOA_TORTURE_BREAK control -- expected)' : ''));
+        }
+
+        // In BREAK mode the gate was SUPPOSED to reject; reaching here means the
+        // control silently passed, which is itself a failure.
+        if (BREAK) die('T6: SOA_TORTURE_BREAK injected allocations but the gate passed (' + label + ')');
     }
-
-    // In BREAK mode the gate was SUPPOSED to reject; reaching here means the
-    // control silently passed, which is itself a failure.
-    if (BREAK) die('T6: SOA_TORTURE_BREAK injected allocations but the gate passed');
 }

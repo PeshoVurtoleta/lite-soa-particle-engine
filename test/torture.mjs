@@ -61,7 +61,7 @@ const TIERS = [
     ['T9 controls', t9],
 ];
 
-function main() {
+async function main() {
     if (typeof globalThis.gc !== 'function') {
         process.stderr.write(
             'torture: FAIL -- run with --expose-gc:  node --expose-gc test/torture.mjs\n');
@@ -70,7 +70,10 @@ function main() {
 
     for (const [name, run] of TIERS) {
         try {
-            run();
+            // T8 is async (lite-scheduler dispatches through a MessageChannel);
+            // every other tier is sync. `await` on a sync tier's undefined is a
+            // harmless no-op, so one loop drives both (S3.1, R6).
+            await run();
         } catch (err) {
             // Tiers normally fail via die() (which exits). A thrown error is an
             // unexpected fault -- surface it with the replay seed and stop.

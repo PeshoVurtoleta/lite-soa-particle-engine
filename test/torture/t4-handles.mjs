@@ -24,7 +24,7 @@
  *     d.ts/type-level half is not runtime-checkable via node:test without a
  *     tsc invocation this package's pipeline does not run -- untestable here.
  */
-import { SoaParticleEngine } from '../../SoaParticleEngine.js';
+import { SoaParticleEngine, LANE_MAX } from '../../SoaParticleEngine.js';
 import { check, PUMP } from './harness.mjs';
 
 export function run() {
@@ -463,4 +463,173 @@ export function run() {
         e._isRunning = false;
         e.destroy();
     }
+
+    // --- D1..D5/R4/R5/R11 (S3.1): emitBurst's hot-path door. The burst door
+    // corpus mirrors the D3 tick corpus one method over: every rejection returns
+    // -1, draws ZERO from the injected rng, leaves all seven lanes byte-identical
+    // and _head unmoved, and NEVER throws for its own arguments. A counting rng
+    // records draws; a snapshot of every lane proves byte-identity. Non-vacuity: a
+    // valid burst in the same block draws 3*count and advances _head by count.
+    {
+        const MAXB = 32;
+        const e = new SoaParticleEngine(MAXB);
+        // Pre-seed a scene so a rejected burst has non-zero lanes to preserve.
+        for (let i = 0; i < MAXB; i++) e.emit(i - 16, i + 1, i & 3, -(i & 3), 0.5 + (i & 3) * 0.1, i);
+        const head0 = e._head;
+
+        // Counting rng: records every draw, returns a valid [0,1).
+        let draws = 0;
+        const rng = { next() { draws++; return 0.5; } };
+
+        // Snapshot all seven lanes, allocated once.
+        const bx = new Float32Array(MAXB), by = new Float32Array(MAXB);
+        const bvx = new Float32Array(MAXB), bvy = new Float32Array(MAXB);
+        const bl = new Float32Array(MAXB), bi = new Float32Array(MAXB);
+        const bd = new Int32Array(MAXB);
+        const snap = () => { bx.set(e.x); by.set(e.y); bvx.set(e.vx); bvy.set(e.vy); bl.set(e.life); bi.set(e.invLife); bd.set(e.data); };
+        const laneDiff = () => {
+            for (let s = 0; s < MAXB; s++) {
+                if (e.x[s] !== bx[s] || e.y[s] !== by[s] || e.vx[s] !== bvx[s] || e.vy[s] !== bvy[s] ||
+                    e.life[s] !== bl[s] || e.invLife[s] !== bi[s] || e.data[s] !== bd[s]) return s;
+            }
+            return -1;
+        };
+
+        // Each rejection case: a label, the call thunk. Every one must return -1,
+        // draw nothing, mutate no lane, not move _head, and not throw.
+        const badCounts = [NaN, -1, 0, 2.5, '3', true, [3], null, undefined, Infinity, 10n, Symbol('s')];
+        for (let k = 0; k < badCounts.length; k++) {
+            snap();
+            draws = 0;
+            const cnt = badCounts[k];
+            let threw = null, ret = 1;
+            try { ret = e.emitBurst(0, 0, cnt, {}, rng); } catch (err) { threw = err; }
+            check(threw === null, () => 'T4.burst: count=' + String(cnt) + ' threw ' + threw);
+            check(ret === -1, () => 'T4.burst: count=' + String(cnt) + ' returned ' + String(ret) + ' not -1');
+            check(draws === 0, () => 'T4.burst: count=' + String(cnt) + ' drew ' + draws + ' (a door rejection draws 0)');
+            check(e._head === head0, () => 'T4.burst: count=' + String(cnt) + ' moved _head');
+            check(laneDiff() === -1, () => 'T4.burst: count=' + String(cnt) + ' mutated lane ' + laneDiff());
+        }
+
+        // Bad rng: null, undefined resolves to the default (NOT a rejection), 42,
+        // a bare function (D1), {}, {next:42}. undefined is handled separately.
+        const badRngs = [null, 42, Math.random, {}, { next: 42 }];
+        for (let k = 0; k < badRngs.length; k++) {
+            snap();
+            const rg = badRngs[k];
+            let threw = null, ret = 1;
+            try { ret = e.emitBurst(0, 0, 3, {}, rg); } catch (err) { threw = err; }
+            check(threw === null, () => 'T4.burst: bad rng #' + k + ' threw ' + threw);
+            check(ret === -1, () => 'T4.burst: bad rng #' + k + ' returned ' + String(ret) + ' not -1');
+            check(e._head === head0, () => 'T4.burst: bad rng #' + k + ' moved _head');
+            check(laneDiff() === -1, () => 'T4.burst: bad rng #' + k + ' mutated a lane');
+        }
+
+        // A throwing rng.next(): PROPAGATES. Particles stored before the throw
+        // remain; _head advanced by exactly that many. Fresh engine so the head
+        // math is clean.
+        {
+            const e2 = new SoaParticleEngine(16);
+            let m = 0;
+            const thr = { next() { m++; if (m > 6) throw new Error('boom'); return 0.5; } };
+            let threw = null;
+            try { e2.emitBurst(0, 0, 5, {}, thr); } catch (err) { threw = err; }
+            check(threw !== null, () => 'T4.burst: a throwing rng.next() must PROPAGATE (D4)');
+            check(e2._head === 2, () => 'T4.burst: after a throw on draw 7, exactly 2 particles are stored, _head=' + e2._head);
+            e2.destroy();
+        }
+
+        // Caller CODE that throws PROPAGATES on ALL THREE paths, not just
+        // rng.next(). typeof-first defends against COERCION (a Symbol/BigInt/
+        // throwing valueOf spec field is rejected with -1, proven by the hostile
+        // spec case above), but it cannot precede a property READ: an accessor
+        // getter runs when the field is read, before any guard sees its value. So
+        // a throwing getter on a spec field, and a throwing getter on rng.next,
+        // both escape. This pins the enumeration exhaustive (D4).
+        {
+            const eg1 = new SoaParticleEngine(8);
+            let threw1 = null;
+            try { eg1.emitBurst(0, 0, 3, { get speed() { throw new Error('boom'); } }, { next: () => 0.5 }); } catch (err) { threw1 = err; }
+            check(threw1 !== null, () => 'T4.burst: a throwing accessor getter on a spec field must PROPAGATE (D4)');
+            eg1.destroy();
+
+            const eg2 = new SoaParticleEngine(8);
+            let threw2 = null;
+            try { eg2.emitBurst(0, 0, 3, {}, { get next() { throw new Error('boom'); } }); } catch (err) { threw2 = err; }
+            check(threw2 !== null, () => 'T4.burst: a throwing accessor getter on rng.next must PROPAGATE (D4)');
+            eg2.destroy();
+
+            // The COERCION control: a throwing valueOf on a spec field is a
+            // coercion path, so typeof-first rejects it with -1 and NO throw --
+            // this is what makes the getter propagation a real gap, not a blanket.
+            const eg3 = new SoaParticleEngine(8);
+            let threw3 = null, ret3 = 0;
+            try { ret3 = eg3.emitBurst(0, 0, 3, { speed: { valueOf() { throw new Error('boom'); } } }, { next: () => 0.5 }); } catch (err) { threw3 = err; }
+            check(threw3 === null, () => 'T4.burst: a throwing valueOf spec field is a coercion path -- must NOT throw, threw ' + threw3);
+            check(ret3 === -1, () => 'T4.burst: a throwing valueOf spec field must be rejected with -1, got ' + String(ret3));
+            eg3.destroy();
+        }
+
+        // R4 envelope rejections: each returns -1, draws 0, mutates nothing.
+        const envSpecs = [
+            { life: 0 },                              // life - lifeVar below LIFE_MIN
+            { life: 1, lifeVar: 5 },                  // life - lifeVar negative
+            { speed: LANE_MAX, speedVar: LANE_MAX },  // |speed|+|speedVar| past band
+            { angle: Infinity },                      // angle out of band
+            { angleVar: NaN },                        // angleVar NaN
+            { speed: NaN },                           // speed NaN
+        ];
+        for (let k = 0; k < envSpecs.length; k++) {
+            snap();
+            draws = 0;
+            let threw = null, ret = 1;
+            try { ret = e.emitBurst(0, 0, 5, envSpecs[k], rng); } catch (err) { threw = err; }
+            check(threw === null, () => 'T4.burst: envelope spec #' + k + ' threw ' + threw);
+            check(ret === -1, () => 'T4.burst: envelope spec #' + k + ' returned ' + String(ret) + ' not -1');
+            check(draws === 0, () => 'T4.burst: envelope spec #' + k + ' drew ' + draws);
+            check(e._head === head0, () => 'T4.burst: envelope spec #' + k + ' moved _head');
+            check(laneDiff() === -1, () => 'T4.burst: envelope spec #' + k + ' mutated a lane');
+        }
+
+        // A hostile spec field: a throwing getter fired more than once would throw;
+        // read-once (D3) means it fires exactly once and the burst completes.
+        {
+            const e3 = new SoaParticleEngine(64);
+            let calls = 0;
+            const spec = { get speed() { calls++; if (calls > 1) throw new Error('twice'); return 100; } };
+            let threw = null, ret = -1;
+            try { ret = e3.emitBurst(0, 0, 50, spec, { next: () => 0.5 }); } catch (err) { threw = err; }
+            check(threw === null, () => 'T4.burst: a read-once getter must not throw over a 50-particle burst (D3), threw ' + threw);
+            check(calls === 1, () => 'T4.burst: the speed getter fired ' + calls + ' times, must be exactly 1 (D3)');
+            check(ret === 50, () => 'T4.burst: the getter burst stored ' + ret + ', expected 50');
+            e3.destroy();
+        }
+
+        // Non-vacuity: a VALID burst in the same block draws 3*count and stores count.
+        {
+            snap();
+            draws = 0;
+            const before = e._head;
+            const ret = e.emitBurst(0, 0, 4, { life: 1 }, rng);
+            check(ret === 4, () => 'T4.burst: a valid burst must store 4, got ' + ret);
+            check(draws === 12, () => 'T4.burst: a valid 4-particle burst must draw 12, drew ' + draws);
+            check(e._head === (before + 4) % MAXB, () => 'T4.burst: a valid burst must advance _head by 4');
+        }
+
+        // emitBurst after destroy(): -1, zero draws, no throw.
+        {
+            const e4 = new SoaParticleEngine(4);
+            let dd = 0;
+            const rr = { next() { dd++; return 0.5; } };
+            e4.destroy();
+            let threw = null, ret = 1;
+            try { ret = e4.emitBurst(0, 0, 3, {}, rr); } catch (err) { threw = err; }
+            check(threw === null, () => 'T4.burst: emitBurst after destroy() threw ' + threw);
+            check(ret === -1, () => 'T4.burst: emitBurst after destroy() must return -1, got ' + String(ret));
+            check(dd === 0, () => 'T4.burst: emitBurst after destroy() must draw 0 (R11), drew ' + dd);
+        }
+
+        e.destroy();
+    }
+
 }

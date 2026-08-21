@@ -12,7 +12,7 @@
  * birth-alpha bound, the clear law, and destroy idempotence.
  */
 
-import { SoaParticleEngine } from '../../SoaParticleEngine.js';
+import { SoaParticleEngine, LANE_MAX, LIFE_MAX } from '../../SoaParticleEngine.js';
 import { makePrng, SEED, check } from './harness.mjs';
 
 const MAX = 64;
@@ -200,6 +200,123 @@ export function run() {
         }
         split.destroy();
         whole.destroy();
+    }
+
+    // =====================================================================
+    // emitBurst laws (S3.1). Fresh engines per the Law A/B precedent so the emit
+    // corpus above is untouched. Three laws: the draw-COUNT law (D2), the
+    // draw-ORDER law (R3), and the R4 collapse (an accepted burst stores exactly
+    // count).
+    // =====================================================================
+
+    // Law C -- the draw-COUNT law (D2). A counting rng records exactly 3*count
+    // draws for an accepted burst, a burst into a FULL ring, and a burst at the
+    // envelope band edge; exactly 0 for every door rejection. Non-vacuity is built
+    // in: the accepted cases in the same block record 3*count.
+    {
+        const countingDraws = { n: 0 };
+        const rng = { next() { countingDraws.n++; return 0.5; } };
+
+        // Accepted burst into an empty ring: 3*count draws, returns count.
+        {
+            const e = new SoaParticleEngine(64);
+            countingDraws.n = 0;
+            const ret = e.emitBurst(0, 0, 10, { life: 1 }, rng);
+            check(ret === 10, () => 'T0.burst.count: accepted burst returned ' + ret + ' expected 10 (seed=' + SEED + ')');
+            check(countingDraws.n === 30, () => 'T0.burst.count: accepted burst drew ' + countingDraws.n + ' expected 30 (seed=' + SEED + ')');
+            e.destroy();
+        }
+
+        // A FULL ring: emit() stomps but still stores, so 3*count draws and count
+        // stored -- the stream does not care about occupancy (D2).
+        {
+            const e = new SoaParticleEngine(1);
+            countingDraws.n = 0;
+            const ret = e.emitBurst(0, 0, 8, { life: 1 }, rng);
+            check(ret === 8, () => 'T0.burst.count: full-ring burst returned ' + ret + ' expected 8 (seed=' + SEED + ')');
+            check(countingDraws.n === 24, () => 'T0.burst.count: full-ring burst drew ' + countingDraws.n + ' expected 24 (seed=' + SEED + ')');
+            e.destroy();
+        }
+
+        // At the envelope band edge: life exactly LIFE_MAX with zero variance, and
+        // speed at the lane band with zero variance. Still accepted -> 3*count.
+        {
+            const e = new SoaParticleEngine(16);
+            countingDraws.n = 0;
+            const ret = e.emitBurst(0, 0, 4, { speed: LANE_MAX, speedVar: 0, life: LIFE_MAX, lifeVar: 0, angleVar: 0 }, rng);
+            check(ret === 4, () => 'T0.burst.count: band-edge burst returned ' + ret + ' expected 4 (seed=' + SEED + ')');
+            check(countingDraws.n === 12, () => 'T0.burst.count: band-edge burst drew ' + countingDraws.n + ' expected 12 (seed=' + SEED + ')');
+            e.destroy();
+        }
+
+        // Every door rejection draws 0: bad count, bad rng, bad x, bad y, a failed
+        // R4 envelope, and a destroyed engine.
+        {
+            const e = new SoaParticleEngine(16);
+            const cases = [
+                () => e.emitBurst(0, 0, 0, {}, rng),          // count 0 (R5)
+                () => e.emitBurst(0, 0, -1, {}, rng),         // bad count
+                () => e.emitBurst(0, 0, 3, {}, 42),           // bad rng
+                () => e.emitBurst(0, 0, 3, {}, Math.random),  // bare fn rng (D1)
+                () => e.emitBurst(NaN, 0, 3, {}, rng),        // bad x
+                () => e.emitBurst(0, NaN, 3, {}, rng),        // bad y
+                () => e.emitBurst(0, 0, 3, { life: 0 }, rng), // failed envelope
+            ];
+            for (let k = 0; k < cases.length; k++) {
+                countingDraws.n = 0;
+                const ret = cases[k]();
+                check(ret === -1, () => 'T0.burst.count: door rejection #' + k + ' returned ' + String(ret) + ' not -1 (seed=' + SEED + ')');
+                check(countingDraws.n === 0, () => 'T0.burst.count: door rejection #' + k + ' drew ' + countingDraws.n + ' (a door rejection draws 0) (seed=' + SEED + ')');
+            }
+            // Destroyed engine draws 0.
+            e.destroy();
+            countingDraws.n = 0;
+            const ret = e.emitBurst(0, 0, 3, {}, rng);
+            check(ret === -1 && countingDraws.n === 0, () => 'T0.burst.count: a destroyed engine drew ' + countingDraws.n + ' / returned ' + ret + ' (R11) (seed=' + SEED + ')');
+        }
+    }
+
+    // Law D -- the draw-ORDER law (R3). A sequencing rng over three distinguishable
+    // values proves the order is angle, speed, life: the resulting vx/vy come from
+    // draw1 (angle) x draw2 (speed), and life from draw3. A permuted implementation
+    // passes the count law but fails this.
+    {
+        const KNOWN = [0.25, 0.75, 0.9];
+        let idx = 0;
+        const seq = { next() { return KNOWN[idx++ % 3]; } };
+        const e = new SoaParticleEngine(4);
+        // angleVar PI, speedVar 50, lifeVar 1, from known centres.
+        e.emitBurst(0, 0, 1, { speed: 100, speedVar: 50, angle: 0, angleVar: Math.PI, life: 2, lifeVar: 1 }, seq);
+        // draw1=0.25 -> a = 0 + (0.25*2-1)*PI = -0.5*PI
+        // draw2=0.75 -> s = 100 + (0.75*2-1)*50 = 125
+        // draw3=0.9  -> l = 2 + (0.9*2-1)*1 = 2.8
+        const a = -0.5 * Math.PI, s = 125, l = 2.8;
+        check(e.vx[0] === Math.fround(Math.cos(a) * s), () => 'T0.burst.order: vx=' + e.vx[0] + ' expected cos(angle)*speed=' + Math.fround(Math.cos(a) * s) + ' -- draw1 must feed angle, draw2 speed (seed=' + SEED + ')');
+        check(e.vy[0] === Math.fround(Math.sin(a) * s), () => 'T0.burst.order: vy=' + e.vy[0] + ' expected sin(angle)*speed=' + Math.fround(Math.sin(a) * s) + ' (seed=' + SEED + ')');
+        check(e.life[0] === Math.fround(l), () => 'T0.burst.order: life=' + e.life[0] + ' expected ' + Math.fround(l) + ' -- draw3 must feed life (seed=' + SEED + ')');
+        e.destroy();
+    }
+
+    // Law E -- the R4 collapse. An accepted burst returns EXACTLY count, never
+    // less, across a corpus that stresses the store: a full ring, max=1,
+    // count=1000, and speeds at the envelope edge. This is the strongest claim of
+    // the session; the SOA_TORTURE_BURST_NO_ENVELOPE control removes the envelope
+    // and makes it bite.
+    {
+        const rng = makePrng(SEED);
+        const nextFloat = { next() { return (rng() >>> 0) / 4294967296; } };
+        const corpus = [
+            [new SoaParticleEngine(1), 1000, { life: 1 }],                                    // full ring, count 1000
+            [new SoaParticleEngine(1000), 1000, { speed: LANE_MAX, speedVar: 0, angleVar: 0, life: 1 }], // speed at edge
+            [new SoaParticleEngine(256), 256, { speed: 300, speedVar: 100, life: 2, lifeVar: 1 }],       // normal cone
+            [new SoaParticleEngine(4), 1, { life: LIFE_MAX, lifeVar: 0 }],                     // life at edge, count 1
+        ];
+        for (let k = 0; k < corpus.length; k++) {
+            const e = corpus[k][0], count = corpus[k][1], spec = corpus[k][2];
+            const ret = e.emitBurst(0, 0, count, spec, nextFloat);
+            check(ret === count, () => 'T0.burst.collapse: burst #' + k + ' returned ' + ret + ' expected EXACTLY ' + count + ' (R4 -- the envelope guarantees every store succeeds) (seed=' + SEED + ')');
+            e.destroy();
+        }
     }
 
     // Clear law: after clear(), no slot is alive and head === 0.

@@ -25,7 +25,7 @@ claim.
 
 Traditional particle systems store each particle as an object: `{ x, y, vx, vy, life }`. When you loop over 10,000 particles, the CPU fetches each object from a random memory location -- **cache miss after cache miss**.
 
-SoA stores each property in a contiguous `Float32Array`. When you loop over `x[0], x[1], x[2]...`, the data is sequential in memory -- the CPU prefetcher loads it all into L1 cache in one shot. **10x fewer cache misses** for tight physics loops.
+SoA stores each property in a contiguous `Float32Array`. When you loop over `x[0], x[1], x[2]...`, the data is sequential in memory -- the CPU prefetcher loads it all into L1 cache in one shot, instead of chasing a scattered object graph across the heap.
 
 ## Installation
 
@@ -101,6 +101,7 @@ the only thing between a typo and a dead process. See
 | Method | Description |
 |--------|-------------|
 | `.emit(x, y, vx, vy, life, dataFlag?)` | Emit a particle at the ring write cursor. Never throws -- silently rejects anything it cannot store (see Input Contract). When full it overwrites the slot at the cursor, alive or not (see Ring Buffer Behavior). |
+| `.emitBurst(x, y, count, spec?, rng?)` | Emit a cone of `count` particles with the randomness supplied as an argument, so the spawn is replayable (see Determinism and replay). Never throws for a bad-VALUE argument (a coercing spec field -- Symbol, BigInt, throwing `valueOf` -- is rejected with `-1`); caller CODE propagates -- a throwing `rng.next()`, or a throwing accessor getter on a spec field or on `rng.next`. Returns `-1` on a door rejection or exactly `count`. |
 | `.onTick(callback)` | Register the frame callback. Receives raw TypedArrays. |
 | `.start()` | Start the RAF loop. |
 | `.stop()` / `.pause()` | Stop the RAF loop. |
@@ -253,9 +254,43 @@ function explode(x, y) {
 }
 ```
 
+The same explosion as a single `emitBurst`. The first form uses the platform PRNG
+inside the caller's own loop, so two runs diverge; the second injects a seeded RNG
+and replays byte-for-byte (see Determinism and replay):
+
+```javascript
+import { Random } from '@zakkster/lite-random';
+const rng = new Random(12345); // any object with a `.next()` -> [0, 1) satisfies it
+
+function explode(x, y) {
+    // Core flash (type 0): a full disc, fast, short-lived.
+    engine.emitBurst(x, y, 20, { speed: 300, angle: 0, angleVar: Math.PI, life: 0.3, data: 0 }, rng);
+    // Debris (type 1): a full disc, speed 50..200, longer-lived.
+    engine.emitBurst(x, y, 40, { speed: 125, speedVar: 75, angle: 0, angleVar: Math.PI, life: 1.5, data: 1 }, rng);
+}
+```
+
 ## Ring Buffer Behavior
 
 `emit()` writes at an internal write cursor and advances it by one, wrapping at `max`. When the pool is full it overwrites the slot at the cursor **whether or not that slot is still alive** -- it does not search for the oldest or a dead slot. With mixed lifetimes the cursor slot is frequently not the oldest particle, so a long-lived particle can be overwritten while dead slots sit free. The upside is bounded, allocation-free, GC-free behaviour under extreme load: emission never crashes and never stalls the frame. A liveness-aware overwrite policy is planned (tracked as finding P-01); until it ships, the write-cursor overwrite above is the exact documented contract.
+
+## Determinism and replay
+
+`emitBurst` takes its randomness as an argument, which is what makes a scene
+replayable. The contract, and its three bounds, live in one paragraph so nobody
+trusts the claim without the caveats: given a **fresh** engine, an identical
+emit/tick script, and an RNG replaying the same seed, every lane is byte-identical
+across runs and across machines -- but (1) `clear()` is **not** a replay reset: it
+zeroes the `life` lane and the write cursor and leaves `x/y/vx/vy/data` from the
+previous scene, so a shorter replay after `clear()` matches a fresh engine only
+where it happens to overwrite (construct a new engine to replay); (2) parity comes
+from **seed** parity, not from sharing one `Random` instance -- two engines sharing
+one instance interleave their draws and both diverge, while two instances seeded
+alike replay identically; and (3) **f32 storage is the equality domain** -- lanes
+compare as stored (f32 for the six float lanes, i32 for `data`), never as the f64
+the caller passed. Each `emitBurst` particle draws exactly three RNG values, in the
+order `angle, speed, life`, unconditionally -- so the stream is independent of ring
+occupancy and a replay survives a full pool.
 
 ## TypeScript
 

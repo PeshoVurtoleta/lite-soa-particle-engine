@@ -2,8 +2,9 @@
  * @zakkster/lite-soa-particle-engine -- Zero-GC Canvas Particle System
  *
  * Uses Structure of Arrays (SoA) to maintain particles in flat TypedArrays.
- * CPU cache-friendly: iterating a Float32Array is ~10x faster than iterating
- * an array of objects because the data is contiguous in memory.
+ * CPU cache-friendly: iterating a Float32Array keeps the data contiguous in
+ * memory, so the prefetcher streams it -- unlike an array of objects, whose
+ * fields are scattered across the heap.
  *
  * Ring buffer design: when the pool is full, emit() overwrites the slot at the
  * write cursor whether or not it is still alive. With mixed lifetimes that slot
@@ -15,7 +16,7 @@
  * for maximum rendering flexibility.
  */
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 /**
  * Upper bound on maxParticles, a policy number (not a probe of what happens to
@@ -67,6 +68,24 @@ export const LIFE_MAX = 3.4028235677973362e+38;
 export const LANE_MAX = 3.4028235677973362e+38;
 
 /**
+ * The default RNG for emitBurst: a frozen module singleton created ONCE at load,
+ * so the hot path never builds it and never branches on a default parameter that
+ * re-evaluates (decisions/0004-the-spawn-path.md D1). It is the ONLY site in this
+ * file that reads the platform pseudo-random source; every hot path takes `rng`
+ * as an argument. `rng === undefined ? DEFAULT_RNG : rng` resolves once, above
+ * emitBurst's loop, into a local. The one-method `.next()` contract is exactly
+ * lite-random's `Random.prototype.next`, so a Random instance is passed directly.
+ */
+const DEFAULT_RNG = Object.freeze({ next: Math.random });
+
+/**
+ * Read once, above emitBurst's loop, for a spec of null/undefined/a primitive:
+ * property reads off it yield undefined, so every field takes its default without
+ * throwing (decisions/0004-the-spawn-path.md D3). Frozen; never mutated.
+ */
+const EMPTY_SPEC = Object.freeze({});
+
+/**
  * COLD-path helper: render a rejected constructor argument into an error message
  * without EVER throwing itself, so this library's named error can never be
  * replaced by a foreign one on the way to a throw -- a door with a gap. Strings
@@ -102,6 +121,15 @@ function _showArg(v) {
  *     [LIFE_MIN, LIFE_MAX] (which also rejects NaN, both infinities, 0 and
  *     negatives), or whose dataFlag is not an exact int32. A rejected emit
  *     leaves the engine byte-identical and does not advance _head.
+ *   - emitBurst() is emit()'s never-throws-for-a-bad-value door over a whole
+ *     cone (S3.1, decisions/0004-the-spawn-path.md): x/y/count/spec are
+ *     typeof-first validated ONCE per burst, and a once-per-burst envelope bounds
+ *     every drawn value into the lane/life bands. Every particle draws EXACTLY 3
+ *     rng values in the ORDER angle, speed, life. Returns -1 on a door rejection
+ *     (zero drawn, zero written) or exactly `count` on an accepted burst. It
+ *     throws only on caller CODE, which propagates: a throwing rng.next(), a
+ *     throwing accessor getter on a spec field, or a throwing accessor getter on
+ *     rng.next.
  *   - A frame gap larger than maxDt is CLAMPED to maxDt: a clamped frame LOSES
  *     time by design (the alternative is particles tunnelling). This engine is
  *     therefore NOT a fixed-step simulator. A caller needing a fixed-step
@@ -261,6 +289,112 @@ export class SoaParticleEngine {
         // slot is reused (and after S4 until the next compaction). -1 is the one
         // rejection value, returned on every early-return above.
         return i;
+    }
+
+    /**
+     * Emit a cone of `count` particles from (x, y), the randomness supplied as an
+     * argument so the spawn is replayable (decisions/0004-the-spawn-path.md).
+     *
+     * HOT path. Never throws for a bad-VALUE argument: x, y, count and every spec
+     * field pass the same typeof-first door as emit(), validated ONCE per burst
+     * (D4). typeof-first defends against coercion (a Symbol, BigInt or throwing
+     * valueOf spec field is rejected with -1), but it cannot precede a property
+     * READ, so caller CODE propagates: a throwing rng.next(), or a throwing
+     * accessor getter on a spec field or on rng.next. Swallowing any of these
+     * would turn a caller bug into a silently half-written burst; particles
+     * stored before the throw remain and _head has
+     * advanced by exactly that many.
+     *
+     * Draw law (D2, NORMATIVE): every particle in an accepted burst consumes
+     * EXACTLY 3 rng.next() draws in the ORDER angle, speed, life, unconditionally
+     * -- not conditionally on the matching *Var, not on the store being accepted.
+     * The stream is independent of ring occupancy, which is what makes a replay
+     * survive a full pool. A door-rejected burst draws ZERO.
+     *
+     * Return (D4 as amended by R4): -1 when the burst is rejected at the door
+     * (nothing drawn, nothing written); otherwise the count of particles stored,
+     * which for an accepted burst is EXACTLY `count`. The once-per-burst envelope
+     * check below bounds every drawn value into the lane/life bands, so every
+     * individual store succeeds and there is no 0..count range.
+     *
+     * @param {number} x     Burst origin X. Same band as emit(): [-LANE_MAX, LANE_MAX].
+     * @param {number} y     Burst origin Y. Same band as x.
+     * @param {number} count Positive integer count of particles. 0, negatives,
+     *   fractions, NaN, Infinity and non-numbers are door rejections (R5).
+     * @param {object} [spec] Cone spec, read once per field (D3):
+     *   { speed=100, speedVar=0, angle=0, angleVar=Math.PI, life=1, lifeVar=0,
+     *     data=0 }. A missing field takes its default; null/undefined/a primitive
+     *     read as all-defaults. Each field is typeof-validated; the whole burst is
+     *     rejected unless |speed|+|speedVar| <= LANE_MAX, angle/angleVar are in the
+     *     lane band, and life +/- lifeVar lie in [LIFE_MIN, LIFE_MAX].
+     * @param {{ next: () => number }} [rng] RNG with a single .next() -> [0,1)
+     *   method (lite-random's Random satisfies it directly). Defaults to the
+     *   module singleton. A bare function is rejected (D1).
+     * @returns {number} -1 on a door rejection; otherwise the count stored
+     *   (exactly `count` for an accepted burst).
+     */
+    emitBurst(x, y, count, spec, rng) {
+        if (this._destroyed) return -1;
+
+        // Resolve the RNG once, above the loop -- no default parameter that
+        // re-evaluates, no branch inside the loop (D1). undefined -> the singleton.
+        const r = rng === undefined ? DEFAULT_RNG : rng;
+
+        // Door, validated ONCE per burst before any draw (D4/R11). x/y reuse the
+        // position lane band; count is a positive integer; rng is an object with a
+        // .next() function (a bare function fails the object half and is rejected).
+        if (!(typeof x === 'number' && x >= -LANE_MAX && x <= LANE_MAX)) return -1;
+        if (!(typeof y === 'number' && y >= -LANE_MAX && y <= LANE_MAX)) return -1;
+        if (!(typeof count === 'number' && count >= 1 && (count | 0) === count)) return -1;
+        if (!(r !== null && typeof r === 'object' && typeof r.next === 'function')) return -1;
+
+        // spec -> locals, each raw field read EXACTLY ONCE (D3), then defaulted.
+        // A null/undefined/primitive spec reads as all-defaults via EMPTY_SPEC.
+        const useSpec = (spec === null || spec === undefined) ? EMPTY_SPEC : spec;
+        const rSpeed = useSpec.speed, rSpeedVar = useSpec.speedVar,
+              rAngle = useSpec.angle, rAngleVar = useSpec.angleVar,
+              rLife = useSpec.life, rLifeVar = useSpec.lifeVar, rData = useSpec.data;
+        const speed    = rSpeed    === undefined ? 100     : rSpeed;
+        const speedVar = rSpeedVar === undefined ? 0       : rSpeedVar;
+        const angle    = rAngle    === undefined ? 0       : rAngle;
+        const angleVar = rAngleVar === undefined ? Math.PI : rAngleVar;
+        const life     = rLife     === undefined ? 1       : rLife;
+        const lifeVar  = rLifeVar  === undefined ? 0       : rLifeVar;
+        const data     = rData     === undefined ? 0       : rData;
+
+        // typeof-first (D4): reject any non-number spec field WITHOUT throwing, so
+        // a Symbol / BigInt / hostile valueOf never reaches Math.abs below. data
+        // must also be an exact int32, emit()'s dataFlag contract.
+        if (!(typeof speed === 'number' && typeof speedVar === 'number' &&
+              typeof angle === 'number' && typeof angleVar === 'number' &&
+              typeof life  === 'number' && typeof lifeVar  === 'number' &&
+              typeof data  === 'number' && (data | 0) === data)) return -1;
+
+        // Envelope, checked ONCE (R4). It bounds every value the loop can draw
+        // into the lane/life bands, so every per-particle store SUCCEEDS and the
+        // return collapses to exactly `count`. angle/angleVar in band keep every
+        // drawn `a` finite; |speed|+|speedVar| bounds |s|; life +/- lifeVar keeps
+        // every drawn life in its band. Each predicate also rejects NaN for free.
+        if (!(angle    >= -LANE_MAX && angle    <= LANE_MAX)) return -1;
+        if (!(angleVar >= -LANE_MAX && angleVar <= LANE_MAX)) return -1;
+        if (!(Math.abs(speed) + Math.abs(speedVar) <= LANE_MAX)) return -1;
+        const loLife = life - lifeVar, hiLife = life + lifeVar;
+        if (!(loLife >= LIFE_MIN && loLife <= LIFE_MAX &&
+              hiLife >= LIFE_MIN && hiLife <= LIFE_MAX)) return -1;
+
+        // Hot loop. Draw angle, speed, life (D2 order), then store through the
+        // guarded emit(). Zero allocation: primitives only, no object literals, no
+        // bind, no spread. n counts actual stores -- honest, and it collapses to
+        // count under the envelope above; without the envelope it drops below and
+        // the R4 collapse law bites.
+        let n = 0;
+        for (let k = 0; k < count; k++) {
+            const a = angle + (r.next() * 2 - 1) * angleVar;
+            const s = speed + (r.next() * 2 - 1) * speedVar;
+            const l = life  + (r.next() * 2 - 1) * lifeVar;
+            if (this.emit(x, y, Math.cos(a) * s, Math.sin(a) * s, l, data) !== -1) n++;
+        }
+        return n;
     }
 
     /**

@@ -6,6 +6,36 @@ export type TickCallback = (
     data: Int32Array, max: number
 ) => void;
 
+/**
+ * The RNG contract for emitBurst: exactly one method, `.next()` returning a float
+ * in [0, 1). lite-random's `Random` satisfies it directly. A bare function does
+ * NOT satisfy it and is rejected at the door.
+ */
+export interface Rng {
+    next(): number;
+}
+
+/**
+ * The cone spec for emitBurst. Every field is optional and takes a documented
+ * default; a missing field is not an error. Symmetric variance about each centre.
+ */
+export interface BurstSpec {
+    /** Base speed. Default 100. */
+    speed?: number;
+    /** Symmetric speed variance; each particle draws speed +/- this. Default 0. */
+    speedVar?: number;
+    /** Base emission angle in radians. Default 0. */
+    angle?: number;
+    /** Symmetric angle variance; default Math.PI (a full disc). */
+    angleVar?: number;
+    /** Base lifetime in seconds. Default 1. */
+    life?: number;
+    /** Symmetric life variance. Default 0. */
+    lifeVar?: number;
+    /** Recipe ID / int32 flag stored on every particle. Default 0. */
+    data?: number;
+}
+
 export interface SoaParticleEngineOptions {
     /**
      * Largest frame delta passed to onTick. A larger gap is clamped to this and
@@ -45,6 +75,26 @@ export class SoaParticleEngine {
      *   slot is reused.
      */
     emit(x: number, y: number, vx: number, vy: number, life: number, dataFlag?: number): number;
+    /**
+     * Emit a cone of `count` particles from (x, y) with the randomness supplied as
+     * an argument, so the spawn is replayable. Never throws for a bad-VALUE
+     * argument (x/y/count/spec are typeof-first validated once per burst, which
+     * rejects a coercing spec field -- Symbol, BigInt, throwing valueOf -- with
+     * -1). Caller CODE propagates: a throwing `rng.next()`, or a throwing accessor
+     * getter on a spec field or on `rng.next` (typeof cannot precede a property
+     * read). Particles stored before the throw remain. Every accepted particle
+     * draws exactly 3 rng values in the order angle, speed, life.
+     * @param count Positive integer; 0, negatives, fractions and non-numbers are
+     *   door rejections.
+     * @param spec Cone spec; every field optional. The whole burst is rejected
+     *   unless `|speed| + |speedVar| <= LANE_MAX`, `angle`/`angleVar` lie in the
+     *   lane band, and `life +/- lifeVar` lie in [LIFE_MIN, LIFE_MAX].
+     * @param rng RNG with a single `.next()` -> [0, 1) method; defaults to the
+     *   platform PRNG. A bare function is rejected.
+     * @returns -1 on a door rejection (nothing drawn, nothing written); otherwise
+     *   the count stored, which for an accepted burst is exactly `count`.
+     */
+    emitBurst(x: number, y: number, count: number, spec?: BurstSpec, rng?: Rng): number;
     /**
      * Register the per-frame callback. A function registers; `null` or
      * `undefined` unregister. Anything else throws a named TypeError at the door.

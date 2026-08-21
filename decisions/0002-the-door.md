@@ -486,6 +486,45 @@ throw. This inverts the shipped node:test at
 `test/SoaParticleEngine.test.js:296`, which asserted the throw and is flipped,
 not deleted.
 
+## Amendment -- 2026-08-21, v1.2.0 (S3.1): the burst door admits `count`, `spec`, `rng`
+
+`emitBurst(x, y, count, spec, rng)` (`decisions/0004-the-spawn-path.md`) opens
+the door to three arguments this record did not bound. They obey the SAME law --
+`typeof` before value, one negation, no coercion, no caller code on the reject
+path -- so the door family owns them, and this is the amendment that records it
+(the same move the `maxDt: Infinity` amendment made above).
+
+- **`x`, `y`** reuse the position lane band unchanged: `typeof v === 'number' &&
+  v >= -LANE_MAX && v <= LANE_MAX`. They are burst-invariant, validated once.
+- **`count`** must be a positive integer: `typeof count === 'number' &&
+  count >= 1 && (count | 0) === count`. The `>= 1` half rejects `0` (a
+  door rejection by design -- see 0004 R5), negatives and `NaN`; `(count | 0) ===
+  count` rejects fractions and `Infinity`; `typeof` first rejects `'3'`, `true`,
+  `[3]`, `null`, `undefined`, `10n`, `Symbol()` without coercing or throwing.
+- **`rng`** is validated as `rng !== null && typeof rng === 'object' &&
+  typeof rng.next === 'function'` after `undefined` resolves to `DEFAULT_RNG`. A
+  bare function (the platform PRNG passed directly) fails the `object` half and is
+  rejected -- deliberately, per 0004 D1.
+- **every `spec` field** passes a `typeof`-first guard exactly as a lane does,
+  read ONCE into a local (0004 D3). `typeof` leads, so a hostile field (a
+  `Symbol`, a `BigInt`, an object with a throwing `valueOf`) is rejected before an
+  arithmetic operator can run its code, and `emitBurst` keeps `emit()`'s
+  never-throws contract. `data` additionally passes `(data | 0) === data`.
+
+On TOP of the type door, `emitBurst` adds a once-per-burst ENVELOPE check (0004
+R4) that has no analogue in `emit()`: `angle`/`angleVar` in `[-LANE_MAX,
+LANE_MAX]`, `|speed| + |speedVar| <= LANE_MAX`, and `life +/- lifeVar` in
+`[LIFE_MIN, LIFE_MAX]`. This is not a new KIND of door -- it is the same reject-
+before-write discipline -- but it is stronger: it guarantees every per-particle
+store succeeds, which collapses the return type to `-1` or exactly `count`. The
+documented ways `emitBurst` throws are all caller CODE that propagates -- a
+`rng.next()` that throws, a throwing accessor getter on a `spec` field, or a
+throwing accessor getter on `rng.next`. `typeof`-first buys no-throw against
+COERCION only (a `Symbol`, a `BigInt`, a throwing `valueOf` are rejected with
+`-1`); it cannot precede a property READ, so an accessor getter runs before any
+guard sees its value. None of these is an argument of ours, and swallowing them
+would convert a caller bug into a silently half-written burst.
+
 ## References
 
 - `SoaParticleEngine_ROADMAP.md` section 2, findings P-02..P-06, P-13, P-14,

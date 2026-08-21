@@ -25,6 +25,7 @@
 
 import { SoaParticleEngine, LANE_MAX, LIFE_MIN, LIFE_MAX } from '../../SoaParticleEngine.js';
 import { makePrng, SEED, check } from './harness.mjs';
+import { Random } from '@zakkster/lite-random';
 
 const MAX = 128;          // ring size
 const FRAMES = 10000;     // frames driven through tick(dt)
@@ -75,6 +76,45 @@ export function makeOracle(max, maxDt, physicsG) {
             const i = head;
             head = (head + 1) % max;
             return i;
+        },
+        // Mirrors emitBurst EXACTLY: same door, same envelope, same 3-draw order
+        // (angle, speed, life), same store through this.emit (which frounds). Given
+        // the same rng stream the oracle and engine land on byte-identical lanes.
+        burst(x, y, count, rng, spec) {
+            const r = rng;
+            if (!(typeof x === 'number' && x >= -LANE_MAX && x <= LANE_MAX)) return -1;
+            if (!(typeof y === 'number' && y >= -LANE_MAX && y <= LANE_MAX)) return -1;
+            if (!(typeof count === 'number' && count >= 1 && (count | 0) === count)) return -1;
+            if (!(r !== null && typeof r === 'object' && typeof r.next === 'function')) return -1;
+            const useSpec = (spec === null || spec === undefined) ? {} : spec;
+            const rSpeed = useSpec.speed, rSpeedVar = useSpec.speedVar,
+                  rAngle = useSpec.angle, rAngleVar = useSpec.angleVar,
+                  rLife = useSpec.life, rLifeVar = useSpec.lifeVar, rData = useSpec.data;
+            const speed    = rSpeed    === undefined ? 100     : rSpeed;
+            const speedVar = rSpeedVar === undefined ? 0       : rSpeedVar;
+            const angle    = rAngle    === undefined ? 0       : rAngle;
+            const angleVar = rAngleVar === undefined ? Math.PI : rAngleVar;
+            const life     = rLife     === undefined ? 1       : rLife;
+            const lifeVar  = rLifeVar  === undefined ? 0       : rLifeVar;
+            const data     = rData     === undefined ? 0       : rData;
+            if (!(typeof speed === 'number' && typeof speedVar === 'number' &&
+                  typeof angle === 'number' && typeof angleVar === 'number' &&
+                  typeof life  === 'number' && typeof lifeVar  === 'number' &&
+                  typeof data  === 'number' && (data | 0) === data)) return -1;
+            if (!(angle    >= -LANE_MAX && angle    <= LANE_MAX)) return -1;
+            if (!(angleVar >= -LANE_MAX && angleVar <= LANE_MAX)) return -1;
+            if (!(Math.abs(speed) + Math.abs(speedVar) <= LANE_MAX)) return -1;
+            const loLife = life - lifeVar, hiLife = life + lifeVar;
+            if (!(loLife >= LIFE_MIN && loLife <= LIFE_MAX &&
+                  hiLife >= LIFE_MIN && hiLife <= LIFE_MAX)) return -1;
+            let n = 0;
+            for (let k = 0; k < count; k++) {
+                const a = angle + (r.next() * 2 - 1) * angleVar;
+                const sp = speed + (r.next() * 2 - 1) * speedVar;
+                const l = life  + (r.next() * 2 - 1) * lifeVar;
+                if (this.emit(x, y, Math.cos(a) * sp, Math.sin(a) * sp, l, data) !== -1) n++;
+            }
+            return n;
         },
         tick(dt) {
             if (!(typeof dt === 'number' && dt >= 0)) return false;
@@ -174,6 +214,28 @@ export function run() {
             check(re === ro,
                 () => 'T5: emit receipt diverged engine=' + re + ' oracle=' + ro +
                     ' (seed=' + SEED + ' frame=' + f + ' emit=' + e + ')');
+        }
+
+        // A burst step (S3.1): both engine and oracle consume the SAME rng stream
+        // via two Random instances seeded alike, in the SAME 3-draw order (R3), so
+        // they must land on byte-identical lanes. ~1 in 3 frames drives a
+        // deliberately envelope-violating spec so the shared -1 path is fuzzed too.
+        {
+            const rb = prng();
+            const seed = (rb ^ (f * 2654435761)) | 0;
+            const count = 1 + (rb % 5); // 1..5
+            let spec;
+            if ((rb % 3) === 0) {
+                spec = { speed: LANE_MAX, speedVar: LANE_MAX, life: 1 }; // envelope violation -> both -1
+            } else {
+                const sp = 40 + (rb % 200);
+                spec = { speed: sp, speedVar: (rb % 30), angle: 0, angleVar: Math.PI, life: 0.3 + (rb % 200) / 100, lifeVar: (rb % 10) / 100 };
+            }
+            const be = engine.emitBurst(20, -10, count, spec, new Random(seed));
+            const bo = oracle.burst(20, -10, count, new Random(seed), spec);
+            check(be === bo,
+                () => 'T5: burst receipt diverged engine=' + be + ' oracle=' + bo +
+                    ' (seed=' + SEED + ' frame=' + f + ')');
         }
 
         // dt corpus: mostly valid, occasionally clamped (> maxDt), occasionally

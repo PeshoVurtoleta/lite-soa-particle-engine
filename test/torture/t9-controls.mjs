@@ -18,9 +18,11 @@
 
 import { SoaParticleEngine, LIFE_MIN, LIFE_MAX, LANE_MAX } from '../../SoaParticleEngine.js';
 import { runOpsGate, headInvariant, snapshotLaneBytes, die } from './harness.mjs';
+import { run as t0 } from './t0-laws.mjs';
 import { run as t1 } from './t1-degenerate.mjs';
 import { run as t4 } from './t4-handles.mjs';
 import { makeOracle, diverge, integrateLanes } from './t5-fuzz.mjs';
+import { Random } from '@zakkster/lite-random';
 
 /** Retained sink so the control's allocations survive GC (arrayBuffers grows). */
 const leak = [];
@@ -67,6 +69,101 @@ const ONTICK_NO_VALIDATE = process.env.SOA_TORTURE_ONTICK_NO_VALIDATE === '1';
 const START_MUTATE_FIRST = process.env.SOA_TORTURE_START_MUTATE_FIRST === '1';
 const LOOP_UNGUARDED_REARM = process.env.SOA_TORTURE_LOOP_UNGUARDED_REARM === '1';
 const LOOP_ADVANCE_ALWAYS = process.env.SOA_TORTURE_LOOP_ADVANCE_ALWAYS === '1';
+
+/**
+ * S3.1 whole-tier controls, one per new emitBurst decision. Each installs a
+ * reverted emitBurst on the prototype process-wide and re-runs the tier whose
+ * new burst pin MUST die. Run both ways and compare exit codes.
+ *   SOA_TORTURE_BURST_LAZY_DRAW    -- draw a term only when its *Var is nonzero
+ *                                     (the D2 revert); re-runs T0, whose draw-COUNT
+ *                                     law expects 3*count unconditionally.
+ *   SOA_TORTURE_BURST_SPEC_IN_LOOP -- re-read spec every particle (the D3 revert);
+ *                                     re-runs T4, whose read-once getter pin fires
+ *                                     the getter more than once and throws.
+ *   SOA_TORTURE_BURST_BARE_FN_RNG  -- accept a bare function rng (the D1 revert);
+ *                                     re-runs T4, whose bad-rng pin expects the
+ *                                     bare platform PRNG to be rejected.
+ *   SOA_TORTURE_BURST_SWALLOW_THROW-- swallow a caller rng.next() throw (the D4
+ *                                     revert); re-runs T4, whose propagating-throw
+ *                                     pin expects it to escape.
+ *   SOA_TORTURE_BURST_NO_ENVELOPE  -- drop the once-per-burst envelope (the R4
+ *                                     revert); re-runs T0, whose draw-count law's
+ *                                     envelope door-rejection (life:0 -> -1, 0
+ *                                     draws) instead draws 3*count and returns 0.
+ */
+const BURST_LAZY_DRAW = process.env.SOA_TORTURE_BURST_LAZY_DRAW === '1';
+const BURST_SPEC_IN_LOOP = process.env.SOA_TORTURE_BURST_SPEC_IN_LOOP === '1';
+const BURST_BARE_FN_RNG = process.env.SOA_TORTURE_BURST_BARE_FN_RNG === '1';
+const BURST_SWALLOW_THROW = process.env.SOA_TORTURE_BURST_SWALLOW_THROW === '1';
+const BURST_NO_ENVELOPE = process.env.SOA_TORTURE_BURST_NO_ENVELOPE === '1';
+
+/**
+ * Build a reverted emitBurst that differs from the shipped method in EXACTLY one
+ * dimension (the mode flag), so the matching pin bites for the right reason and no
+ * other. Installed on the prototype only under the corresponding env var.
+ */
+function makeBurstVariant(mode) {
+    return function (x, y, count, spec, rng) {
+        if (this._destroyed) return -1;
+        const r = rng;
+        if (!(typeof x === 'number' && x >= -LANE_MAX && x <= LANE_MAX)) return -1;
+        if (!(typeof y === 'number' && y >= -LANE_MAX && y <= LANE_MAX)) return -1;
+        if (!(typeof count === 'number' && count >= 1 && (count | 0) === count)) return -1;
+        const rngOk = mode.bareFnRng
+            ? (typeof r === 'function' || (r !== null && typeof r === 'object' && typeof r.next === 'function'))
+            : (r !== null && typeof r === 'object' && typeof r.next === 'function');
+        if (!rngOk) return -1;
+        const useSpec = (spec === null || spec === undefined) ? {} : spec;
+        let speed, speedVar, angle, angleVar, life, lifeVar, data;
+        const readSpec = () => {
+            const rS = useSpec.speed, rSV = useSpec.speedVar, rA = useSpec.angle, rAV = useSpec.angleVar,
+                  rL = useSpec.life, rLV = useSpec.lifeVar, rD = useSpec.data;
+            speed = rS === undefined ? 100 : rS;
+            speedVar = rSV === undefined ? 0 : rSV;
+            angle = rA === undefined ? 0 : rA;
+            angleVar = rAV === undefined ? Math.PI : rAV;
+            life = rL === undefined ? 1 : rL;
+            lifeVar = rLV === undefined ? 0 : rLV;
+            data = rD === undefined ? 0 : rD;
+        };
+        readSpec();
+        if (!(typeof speed === 'number' && typeof speedVar === 'number' &&
+              typeof angle === 'number' && typeof angleVar === 'number' &&
+              typeof life  === 'number' && typeof lifeVar  === 'number' &&
+              typeof data  === 'number' && (data | 0) === data)) return -1;
+        if (!mode.noEnvelope) {
+            if (!(angle    >= -LANE_MAX && angle    <= LANE_MAX)) return -1;
+            if (!(angleVar >= -LANE_MAX && angleVar <= LANE_MAX)) return -1;
+            if (!(Math.abs(speed) + Math.abs(speedVar) <= LANE_MAX)) return -1;
+            const loLife = life - lifeVar, hiLife = life + lifeVar;
+            if (!(loLife >= LIFE_MIN && loLife <= LIFE_MAX &&
+                  hiLife >= LIFE_MIN && hiLife <= LIFE_MAX)) return -1;
+        }
+        const nextOf = (typeof r === 'function') ? r : function () { return r.next(); };
+        let n = 0;
+        for (let k = 0; k < count; k++) {
+            if (mode.specInLoop) readSpec(); // D3 revert: re-read every particle
+            let a, sp, l;
+            try {
+                if (mode.lazyDraw) {
+                    // D2 revert: draw a term only when its variance is nonzero.
+                    a  = angleVar !== 0 ? angle + (nextOf() * 2 - 1) * angleVar : angle;
+                    sp = speedVar !== 0 ? speed + (nextOf() * 2 - 1) * speedVar : speed;
+                    l  = lifeVar  !== 0 ? life  + (nextOf() * 2 - 1) * lifeVar  : life;
+                } else {
+                    a  = angle + (nextOf() * 2 - 1) * angleVar;
+                    sp = speed + (nextOf() * 2 - 1) * speedVar;
+                    l  = life  + (nextOf() * 2 - 1) * lifeVar;
+                }
+                if (this.emit(x, y, Math.cos(a) * sp, Math.sin(a) * sp, l, data) !== -1) n++;
+            } catch (err) {
+                if (mode.swallowThrow) break; // D4 revert: swallow the caller throw
+                throw err;
+            }
+        }
+        return n;
+    };
+}
 
 /**
  * The reverted emit: v1.0.4's Number.isFinite guard for x/y/vx/vy (which passes
@@ -405,6 +502,16 @@ export function run() {
             good.emit(x, y, vx, vy, life, flag);
             bad.emit(x, y, vx, vy, life, flag);
         }
+        // Extend the comparator to the BURST path (S3.1): spawn via emitBurst /
+        // oracle.burst from three Random instances seeded alike, so engine, good
+        // and bad start byte-identical and only the wrong-gravity oracle diverges
+        // under tick. life stays high so nothing expires and the divergence shows.
+        const burstSpec = { speed: 30, speedVar: 10, angle: 0, angleVar: Math.PI, life: 5.0, lifeVar: 0, data: 1 };
+        e.emitBurst(0, 0, 6, burstSpec, new Random(4242));
+        good.burst(0, 0, 6, new Random(4242), burstSpec);
+        bad.burst(0, 0, 6, new Random(4242), burstSpec);
+        if (diverge(e, good, 1e-3) !== null)
+            die('T9 control: the T5 comparator flagged a CORRECT oracle after a burst spawn (over-sensitive / broken)');
         for (let f = 0; f < 10; f++) { e.tick(0.05); good.tick(0.05); bad.tick(0.05); }
         if (diverge(e, good, 1e-3) !== null)
             die('T9 control: the T5 comparator flagged a CORRECT oracle (it is over-sensitive / broken)');
@@ -457,5 +564,79 @@ export function run() {
         SoaParticleEngine.prototype._loop = advanceAlwaysLoop;
         t4();
         die('T9 control: SOA_TORTURE_LOOP_ADVANCE_ALWAYS reverted the clock guard but T4 still passed (the D8 pin cannot catch _lastTime poisoning)');
+    }
+
+    // Control 19 -- the T8 seed-parity comparator is not vacuous, checked IN
+    // PROCESS. Two engines fed two Random at the SAME seed on an identical burst
+    // script MUST agree on all seven lanes; two at DIFFERENT seeds MUST differ. A
+    // comparator that passed the mismatched pair would certify nothing -- the exact
+    // way T8 seed parity would be decorative.
+    {
+        const LANES = ['x', 'y', 'vx', 'vy', 'life', 'invLife', 'data'];
+        const script = (e, rng) => {
+            e.emitBurst(50, 60, 12, { speed: 150, speedVar: 40, angle: 0.4, angleVar: 1.1, life: 2, lifeVar: 0.5, data: 3 }, rng);
+        };
+        const laneDiff = (a, b) => {
+            for (let li = 0; li < LANES.length; li++) {
+                const L = LANES[li];
+                for (let sIdx = 0; sIdx < a[L].length; sIdx++) if (a[L][sIdx] !== b[L][sIdx]) return true;
+            }
+            return false;
+        };
+        const a1 = new SoaParticleEngine(32), b1 = new SoaParticleEngine(32);
+        script(a1, new Random(999)); script(b1, new Random(999));
+        if (laneDiff(a1, b1)) die('T9 control: two Random(999) instances diverged -- the T8 seed-parity comparator is over-sensitive / broken');
+        const a2 = new SoaParticleEngine(32), b2 = new SoaParticleEngine(32);
+        script(a2, new Random(1)); script(b2, new Random(2));
+        if (!laneDiff(a2, b2)) die('T9 control: mismatched seeds (1 vs 2) produced byte-identical lanes -- T8 seed parity would be vacuous');
+        a1.destroy(); b1.destroy(); a2.destroy(); b2.destroy();
+    }
+
+    // Control 20 -- WHOLE-TIER emitBurst lazy-draw revert (SOA_TORTURE_BURST_LAZY_DRAW=1).
+    // Draw a term only when its *Var is nonzero and re-run T0; its draw-COUNT law
+    // (D2) MUST die -- an accepted burst with speedVar/lifeVar 0 then draws fewer
+    // than 3*count.
+    if (BURST_LAZY_DRAW) {
+        SoaParticleEngine.prototype.emitBurst = makeBurstVariant({ lazyDraw: true });
+        t0();
+        die('T9 control: SOA_TORTURE_BURST_LAZY_DRAW reverted the draw law but T0 still passed (the D2 count law cannot catch a conditional draw)');
+    }
+
+    // Control 21 -- WHOLE-TIER emitBurst spec-in-loop revert (SOA_TORTURE_BURST_SPEC_IN_LOOP=1).
+    // Re-read spec every particle and re-run T4; its read-once getter pin (D3) MUST
+    // die -- a throw-on-second-call getter now fires more than once and throws.
+    if (BURST_SPEC_IN_LOOP) {
+        SoaParticleEngine.prototype.emitBurst = makeBurstVariant({ specInLoop: true });
+        t4();
+        die('T9 control: SOA_TORTURE_BURST_SPEC_IN_LOOP reverted the read-once rule but T4 still passed (the D3 getter pin cannot catch per-particle reads)');
+    }
+
+    // Control 22 -- WHOLE-TIER emitBurst bare-fn rng revert (SOA_TORTURE_BURST_BARE_FN_RNG=1).
+    // Accept a bare function rng and re-run T4; its bad-rng pin (D1) MUST die -- the
+    // bare platform PRNG is now accepted instead of rejected.
+    if (BURST_BARE_FN_RNG) {
+        SoaParticleEngine.prototype.emitBurst = makeBurstVariant({ bareFnRng: true });
+        t4();
+        die('T9 control: SOA_TORTURE_BURST_BARE_FN_RNG reverted the rng door but T4 still passed (the D1 pin cannot catch a bare-function rng)');
+    }
+
+    // Control 23 -- WHOLE-TIER emitBurst swallow-throw revert (SOA_TORTURE_BURST_SWALLOW_THROW=1).
+    // Swallow a caller rng.next() throw and re-run T4; its propagating-throw pin
+    // (D4) MUST die -- the throw no longer escapes emitBurst.
+    if (BURST_SWALLOW_THROW) {
+        SoaParticleEngine.prototype.emitBurst = makeBurstVariant({ swallowThrow: true });
+        t4();
+        die('T9 control: SOA_TORTURE_BURST_SWALLOW_THROW reverted the throw contract but T4 still passed (the D4 pin cannot catch a swallowed rng.next() throw)');
+    }
+
+    // Control 24 -- WHOLE-TIER emitBurst no-envelope revert (SOA_TORTURE_BURST_NO_ENVELOPE=1).
+    // Drop the once-per-burst envelope and re-run T0; its draw-count law's envelope
+    // door-rejection (life:0 -> -1, 0 draws) MUST die -- the burst now draws 3*count
+    // and returns 0 instead of rejecting at the door (R4). This is the collapse law
+    // biting: the return no longer collapses to -1 or exactly count.
+    if (BURST_NO_ENVELOPE) {
+        SoaParticleEngine.prototype.emitBurst = makeBurstVariant({ noEnvelope: true });
+        t0();
+        die('T9 control: SOA_TORTURE_BURST_NO_ENVELOPE reverted the envelope but T0 still passed (the R4 collapse law cannot catch the partial burst)');
     }
 }

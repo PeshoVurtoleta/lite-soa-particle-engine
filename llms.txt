@@ -1,4 +1,4 @@
-# @zakkster/lite-soa-particle-engine v1.1.0
+# @zakkster/lite-soa-particle-engine v1.2.0
 
 > Zero-GC canvas particle system using Structure of Arrays. Ring buffer, flat TypedArrays, raw array access. Host-drivable via tick(dt).
 
@@ -10,7 +10,7 @@ None (standalone)
 
 ## Exports
 - `SoaParticleEngine` -- Class
-- `VERSION` -- string ('1.1.0')
+- `VERSION` -- string ('1.2.0')
 - `MAX_PARTICLES` -- number (2**24 = 16777216), the maxParticles ceiling
 - `LIFE_MIN` -- number (2.938735964636876e-39), low end of the legal life band
 - `LIFE_MAX` -- number (3.4028235677973362e+38), high end of the legal life band
@@ -53,6 +53,7 @@ caller's typo and a dead process. See decisions/0002-the-door.md.
   -0 and exactly maxDt are accepted. Returns `true` iff the callback ran; `false`
   on a rejected dt, no registered callback, or a destroyed engine.
 - `.emit(x, y, vx, vy, life, dataFlag?)` -- Emit one particle at the ring write cursor. Never throws; it silently rejects, before touching any lane, an emit whose (1) x/y/vx/vy is not a number (typeof) OR falls outside the symmetric f32 band [-LANE_MAX, LANE_MAX] -- a numeric string, boolean, array or null is REJECTED, not coerced (the band uses relational operators, so null would coerce to 0, which is inside the band; the typeof half is what stops it), and NaN and both infinities are rejected by the band half; (2) life is not a number OR falls outside [LIFE_MIN, LIFE_MAX] -- likewise "1", true and [1] are rejected, not coerced, and the band half also rejects NaN, both infinities, 0 and negatives; or (3) dataFlag is not a number (typeof) OR not an exact int32 ((dataFlag | 0) === dataFlag). The typeof half is not optional: `|` invokes ToNumeric, which throws for a BigInt or Symbol and runs caller code (valueOf, Symbol.toPrimitive) for objects, so a hostile or buggy dataFlag is rejected WITHOUT throwing only because typeof runs first. A rejected emit leaves the engine byte-identical and does not advance the write cursor. Returns the slot index written (in [0, max)) on success, or -1 on every rejection path. The index is a RECEIPT, not an identity: it is valid only until that slot is reused (a full ring overwrites the slot at the cursor whether or not it is alive; see Ring Buffer Design), so do not store it as a durable handle.
+- `.emitBurst(x, y, count, spec?, rng?)` -- Emit a cone of `count` particles from (x, y) with the randomness supplied as an argument, so the spawn is replayable (decisions/0004-the-spawn-path.md). `spec` = `{ speed=100, speedVar=0, angle=0, angleVar=Math.PI, life=1, lifeVar=0, data=0 }`, every field optional; per particle `a = angle + (d1*2-1)*angleVar`, `s = speed + (d2*2-1)*speedVar`, `l = life + (d3*2-1)*lifeVar`, then it stores `(x, y, cos(a)*s, sin(a)*s, l, data)` through emit(). DRAW LAW (D2): every particle draws EXACTLY 3 rng.next() values in the ORDER angle, speed, life, unconditionally -- the RNG stream is independent of ring occupancy, so a replay survives a full pool. `rng` is any object with a single `.next()` -> [0,1) method (lite-random's `Random` satisfies it directly; a bare function is rejected); it defaults to a module singleton reading the platform PRNG. Never throws for a bad-VALUE argument: x, y, count and every spec field pass emit()'s typeof-first door ONCE per burst, and a once-per-burst ENVELOPE rejects the whole burst unless `|speed|+|speedVar| <= LANE_MAX`, `angle`/`angleVar` lie in [-LANE_MAX, LANE_MAX], and `life +/- lifeVar` lie in [LIFE_MIN, LIFE_MAX] -- so every per-particle store succeeds and the return COLLAPSES to `-1` (door rejection, nothing drawn, nothing written) or EXACTLY `count`. `count` must be a positive integer: 0, negatives, fractions, NaN, Infinity and non-numbers are door rejections. typeof-first defends against COERCION only (a Symbol, BigInt or throwing valueOf spec field is rejected with `-1`); it cannot precede a property READ, so caller CODE propagates. The documented ways emitBurst throws are all caller code: a `rng.next()` that throws, a throwing accessor getter on a spec field, or a throwing accessor getter on `rng.next`. On any of them the particles stored before the throw remain and the cursor has advanced by exactly that many. This enumeration assumes `rng.next()` honours its `-> [0,1)` number contract: a next() returning a BigInt or an object with a throwing valueOf/Symbol.toPrimitive throws at the `next()*2` coercion, and one returning a plain object coerces to NaN (rejected by the store); the return is not validated per draw.
 - `.onTick(callback)` -- Register render callback: `(dt, x, y, vx, vy, life, invLife, data, max) => void`. Called every frame (or every tick(dt)) with raw TypedArrays -- mutate them directly. COLD path, so it throws at the door: a function registers; `null` or `undefined` unregister; anything else throws a named TypeError. A non-callable stored here would crash the next frame -- the failure emit()'s never-throws contract exists to prevent.
 - `.start()` / `.stop()` / `.pause()` -- Convenience RAF wrappers around tick(dt).
   `start()` throws a named TypeError (`SoaParticleEngine: start() requires
@@ -71,6 +72,18 @@ that slot is still alive. With mixed lifetimes the cursor slot is frequently not
 the oldest particle, so a long-lived particle can be overwritten while dead slots
 sit free. No crashes, no allocations, no GC. A liveness-aware policy is planned
 (finding P-01); until then the write-cursor overwrite is the documented behaviour.
+
+## Determinism and replay (emitBurst)
+Given a FRESH engine, an identical emit/tick script, and an RNG replaying the same
+seed, every lane is byte-identical across runs and across machines. Three bounds
+ship with that claim, not in a footnote: (1) `clear()` is NOT a replay reset
+(P-30) -- it zeroes `life` and the cursor but leaves `x/y/vx/vy/data` from the
+previous scene, so a shorter replay after `clear()` matches a fresh engine only
+where it happens to overwrite; construct a new engine to replay; (2) parity comes
+from SEED parity, not from sharing one `Random` instance -- two engines sharing one
+instance interleave draws and both diverge, two instances at the same seed replay
+identically; (3) f32 storage is the equality domain -- lanes compare as stored
+(f32 for the six float lanes, i32 for `data`), not as the f64 the caller passed.
 
 ## Usage Example
 ```javascript

@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-soa-particle-engine",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Zero-GC canvas particle system using Structure of Arrays and flat TypedArrays. CPU cache-friendly.",
   "type": "module",
   "main": "SoaParticleEngine.js",
@@ -55,6 +55,8 @@
   ],
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.15.0",
-    "@zakkster/lite-leak": "^1.8.1"
+    "@zakkster/lite-leak": "^1.8.1",
+    "@zakkster/lite-random": "^1.1.0",
+    "@zakkster/lite-scheduler": "^1.0.1"
   }
 }
